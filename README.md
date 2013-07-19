@@ -21,7 +21,9 @@ compression (usually highly recommended).
 
 
 
-TODO: write MOAR WRAPPER! so that zfsync can operate as a neutered user
+TODO: 
+      
+      write MOAR WRAPPER! so that zfsync can operate as a neutered user
       which only has sudo privileges to run zfsync itself, so that remote
       source systems can expose zfsync without exposing themselves to either
       remote root access OR any zfs operations OTHER than the ones
