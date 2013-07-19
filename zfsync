@@ -1,0 +1,143 @@
+#! /usr/bin/perl
+
+## zfsync - synchronize latest snapshot from a source to a target using ZFS incremental rollup snapshots (zfs send -R -I).
+
+## temp format: zfsync [[user@]host:]source target [-z]
+## the -z argument adds ZFS compression.
+## sources in the format host:path or user@host:path will add SSH transport.
+##
+## example: zfsync root@localhost:locutus/source locutus/target
+
+# require IO::Handle;
+
+$source = $ARGV[0];
+$target = $ARGV[1];
+
+if ($ARGV[2] eq '-z') {
+	$compress = 1;
+	$gzip = '| /bin/gzip -3';
+	$zcat = '| /bin/zcat';
+}
+
+if ($source =~ /^\S*:/) {
+	# ssh source
+	$sourcehost = $source;
+	$sourcehost =~ s/:.*$//;
+	$source =~ s/^\S*://;
+	$ssh = "/usr/bin/ssh -c arcfour $sourcehost";
+}
+
+# if we have pv available on the system, let's find it and use it.
+if (-e '/sbin/pv') { $pv = '/sbin/pv'; }
+elsif (-e '/bin/pv') { $pv = '/bin/pv'; }
+elsif (-e '/usr/sbin/pv') { $pv = '/usr/sbin/pv'; }
+elsif (-e '/usr/bin/pv') { $pv = '/usr/bin/pv'; }
+elsif (-e '/usr/local/sbin/pv') { $pv = '/usr/local/sbin/pv'; }
+elsif (-e '/usr/local/bin/pv') { $pv = '/usr/local/bin/pv'; }
+elsif (-e '/opt/pv') { $pv = '/opt/pv'; }
+elsif (-e '/usr/local/opt/pv') { $pv = '/usr/local/opt/pv'; }
+
+@sourcesnaps = `$ssh zfs list -rH -t snapshot -S creation -o name $source`;
+@targetsnaps = `zfs list -rH -t snapshot -S creation -o name $target`;
+
+$targetsnap = @targetsnaps[0];
+$snapname = $targetsnap;
+$snapname =~ s/^.*\@//;
+chomp $snapname;
+
+$sourcesnap2 = $sourcesnaps[0];
+chomp $sourcesnap2;
+
+foreach $snap (@sourcesnaps) {
+	chomp $snap;
+	$sourcesnapname = $snap;
+	$sourcesnapname =~ s/^.*\@//;
+	if ($sourcesnapname == $snapname) { 
+		$match = 1;
+		$sourcesnap1 = $snap;
+	}
+}
+
+if (!($match)) { 
+	print "FAIL: snapshot $snapname does not exist on $source!\n"; 
+	exit 1;
+}
+
+$sourcesnapname = $sourcesnap2;
+$sourcesnapname =~ s/^.*\@//;
+
+if ($sourcesnapname == $snapname) { 
+	print "FAIL: snapshot $snapname is the newest snapshot on $source and already exists on $target - nothing to sync!\n"; 
+	exit 2;
+}
+
+@sendsize = `$ssh zfs send -nP -R -I $sourcesnap1 $sourcesnap2 2>&1`;
+
+foreach $line (@sendsize) {
+	if ($line =~ /^size\s/) { 
+		$line =~ s/^size\s*//;
+		$sendsize = $line;
+		chomp $sendsize;
+	}
+}
+
+print STDERR "Need to transfer approximately " . sprintf("%.1f",$sendsize/1024/1024) . "MB from $source";
+if ($sourcehost) { print STDERR " on host $sourcehost"; }
+print STDERR "...\n";
+
+if ($compress) { print STDERR "Using gzip stream compression...\n"; }
+
+open SOURCE, "$ssh \'zfs send -R -I $sourcesnap1 $sourcesnap2 $gzip\' $zcat |"
+        or print $! ? "Error opening zfs send: $!"
+        : "Exit status $? from zfs send";
+binmode SOURCE;
+
+if ($pv =~ /pv/) { $pv = "| $pv -s $sendsize "; }
+
+open TARGET, "$pv | zfs receive $target"
+        or print $! ? "Error opening zfs receive: $!"
+        : "Exit status $? from zfs receive";
+binmode TARGET;
+
+$blocksize = 65536;
+#$blocksize = 1048576;
+
+while ($bufsize = read (SOURCE, $buffer, $blocksize)) {
+	$xferred += $bufsize;
+	print TARGET $buffer
+        	or die $! ? "Error writing to zfs receive: $!"
+	        : "Exit status $? from zfs receive";
+	
+	if (! ($pv =~ /pv/) ) {
+		# ugly, rough homemade progress meter
+		print STDERR "Transferred " . sprintf("%.1f",$xferred/1024/1024) . " MB (~ " . sprintf("%.2f",$xferred/$sendsize*100*.999) . "%)\n";
+		print STDERR "\e[A";
+	}
+}
+
+close SOURCE
+	or print $! ? "Error closing zfs send: $!"
+	: "Exit status $? from zfs send";
+close TARGET
+	or print $! ? "Error closing zfs receive: $!"
+	: "Exit status $? from zfs receive";
+
+print STDERR "\n";
+
+$targetsnap2 = $sourcesnap2;
+$targetsnap2 =~ s/^.*?\@//;
+$targetsnap2 = "$target\@" . $targetsnap2;
+
+$success = `zfs list -t snap $targetsnap2`;
+
+chomp $targetsnap;
+
+if ($success) { 
+	print "Transfer complete! Updated from $targetsnap to $target\@$sourcesnapname.\n"; 
+	exit 0;
+} else { 
+	print "Transfer FAILED!  Died after transferring " . sprintf("%.1f",$xferred/1024/1024) . " of approximately " . sprintf("%.1f",$sendsize/1024/1024) . " MB. :(\n"; 
+	exit 3;
+}
+
+exit;
