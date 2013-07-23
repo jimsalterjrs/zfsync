@@ -52,7 +52,7 @@ foreach $snap (@sourcesnaps) {
 	chomp $snap;
 	$sourcesnapname = $snap;
 	$sourcesnapname =~ s/^.*\@//;
-	if ($sourcesnapname == $snapname) { 
+	if ($sourcesnapname eq $snapname) { 
 		$match = 1;
 		$sourcesnap1 = $snap;
 	}
@@ -66,7 +66,7 @@ if (!($match)) {
 $sourcesnapname = $sourcesnap2;
 $sourcesnapname =~ s/^.*\@//;
 
-if ($sourcesnapname == $snapname) { 
+if ($sourcesnapname eq $snapname) { 
 	print "FAIL: snapshot $snapname is the newest snapshot on $source and already exists on $target - nothing to sync!\n"; 
 	exit 2;
 }
