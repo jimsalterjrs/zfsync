@@ -10,6 +10,8 @@
 
 # require IO::Handle;
 
+use Sys::Hostname;
+
 $source = $ARGV[0];
 $target = $ARGV[1];
 
@@ -37,64 +39,116 @@ elsif (-e '/usr/local/bin/pv') { $pv = '/usr/local/bin/pv'; }
 elsif (-e '/opt/pv') { $pv = '/opt/pv'; }
 elsif (-e '/usr/local/opt/pv') { $pv = '/usr/local/opt/pv'; }
 
-@sourcesnaps = `$ssh zfs list -rH -t snapshot -S creation -o name $source`;
-@targetsnaps = `zfs list -rH -t snapshot -S creation -o name $target`;
+$hostid = hostname;
 
-$targetsnap = @targetsnaps[0];
-$snapname = $targetsnap;
-$snapname =~ s/^.*\@//;
-chomp $snapname;
+my @dateparts = &get_date;
+my $datestamp = $dateparts[4];
 
-$sourcesnap2 = $sourcesnaps[0];
-chomp $sourcesnap2;
+# get a list of zfsync snapshots from the source
+print STDERR "Getting list of snapshots from source...\n";
+@sourcesnapsraw = `$ssh zfs list -rH -t snapshot -S creation -o name $source`;
+while (my $snap = pop(@sourcesnapsraw)) {
+	if ($snap =~ /zfsync_$hostid/) { push @sourcesnaps, $snap; }
+}
+# we're going to want an extra copy of this array later, for pruning.
+@prunesourcesnaps = @sourcesnaps;
 
-foreach $snap (@sourcesnaps) {
+# does the target exist yet?
+@targetexists = `zfs list -o name`;
+while (my $snap = pop(@targetexists)) { 
 	chomp $snap;
-	$sourcesnapname = $snap;
-	$sourcesnapname =~ s/^.*\@//;
-	if ($sourcesnapname eq $snapname) { 
-		$match = 1;
-		$sourcesnap1 = $snap;
+	if ($snap eq $target) { $targetexists=1; }
+}
+
+if ($targetexists) { 
+	print STDERR "Target exists.  Finding snapshots.\n";
+	@targetsnapsraw = `zfs list -rH -t snapshot -S creation -o name`;
+	while (my $snap = pop(@targetsnapsraw)) {
+		if ($snap =~ /zfsync_$hostid/) { push @targetsnaps, $snap; }
+	}
+	# print STDERR "Found zfsync snapshots on target: \n@targetsnaps\n";
+	$numtargetsnaps = scalar @targetsnaps;
+	# we're going to want an extra copy of these later, for pruning.
+	@prunetargetsnaps = @targetsnaps;
+	# we're going to have to destroy target if we don't have any zfsync snaps on it
+	if (! $numtargetsnaps) {
+		print STDERR "No zfsync snaps on target: destroying target.\n";
+		system ("zfs destroy -r $target");
+		$targetexists = 0;
 	}
 }
 
-if (!($match)) { 
-	print "FAIL: snapshot $snapname does not exist on $source!\n"; 
-	exit 1;
-}
-
-$sourcesnapname = $sourcesnap2;
-$sourcesnapname =~ s/^.*\@//;
-
-if ($sourcesnapname eq $snapname) { 
-	print "FAIL: snapshot $snapname is the newest snapshot on $source and already exists on $target - nothing to sync!\n"; 
-	exit 2;
-}
-
-@sendsize = `$ssh zfs send -nP -R -I $sourcesnap1 $sourcesnap2 2>&1`;
-
-foreach $line (@sendsize) {
-	if ($line =~ /^size\s/) { 
-		$line =~ s/^size\s*//;
-		$sendsize = $line;
-		chomp $sendsize;
+if ($numtargetsnaps) {
+	# make sure we have a snap on the source to match a targetsnap
+	print STDERR "Attempting to match zfsync snapshots on source and target.\n";
+	while (! $matchedsnaps && (my $targetsnap = pop(@targetsnaps))) {
+		chomp $targetsnap;
+		$targetsnapname = $targetsnap;
+		$targetsnapname =~ s/^.*\@//;
+		foreach $sourcesnap (@sourcesnaps) {
+			if (! $matchedsnaps) {
+				chomp $sourcesnap;
+				$sourcesnapname = $sourcesnap;
+				$sourcesnapname =~ s/^.*\@//;
+				if ($targetsnapname eq $sourcesnapname) { 
+					$matchedsnaps = 1; 
+					$oldsourcesnap = $sourcesnap; 
+					$oldsourcesnapname = $oldsourcesnap;
+					$oldsourcesnapname =~ s/^.*?\@//;
+					print STDERR "Found matching zfsync snapshot $sourcesnapname on source and target.\n";
+					$used = `$ssh zfs diff $sourcesnap $source`;
+					if ($used eq '') {
+						print STDERR "No new data on $source since $sourcesnap - nothing to sync, exiting.\n";
+						exit;
+					} 
+				} else {
+					# print STDERR "source snap $sourcesnapname does not match target snap $targetsnapname.\n";
+				}
+			}
+		}
 	}
+	# we're going to have to destroy target if there are no source zfsync snaps
+	if (! $matchedsnaps) {
+		print STDERR "No matching zfsync snaps between source and target: destroying target.\n";
+		system ("zfs destroy -r $target");
+		$targetexists = 0;
+	}
+}	
+
+# create zfsync snapshot on the source
+$newsourcesnap = "$source\@zfsync\_$hostid\_$datestamp";
+print STDERR "Creating $newsourcesnap on source...\n";
+system("$ssh zfs snapshot $newsourcesnap");
+
+if (! $targetexists) {
+	# Woo, first sync... this'll be a hot minute, amirite?
+	print STDERR "Target does not exist - will be created with initial transfer.\n";
+	@sendsize = `$ssh zfs send -nP -R $newsourcesnap 2>&1`;
+	$SOURCE = "$ssh \'zfs send -R $newsourcesnap $gzip\' $zcat ";
+} else {
+	# incremental send yo.  rollback the target to the newest matched snapshot first.
+	print STDERR "Found matching snapshots. Rolling target back to $oldsourcesnapname before transfer.\n";
+	system ("zfs rollback $target\@$oldsourcesnapname");
+	@sendsize = `$ssh zfs send -nP -R -I $oldsourcesnap $newsourcesnap 2>&1`;
+	$SOURCE = "$ssh \'zfs send -R -I $oldsourcesnap $newsourcesnap $gzip\' $zcat ";
 }
 
-print STDERR "Need to transfer approximately " . sprintf("%.1f",$sendsize/1024/1024) . "MB from $source";
-if ($sourcehost) { print STDERR " on host $sourcehost"; }
-print STDERR "...\n";
+# process sendsize: last line is summary, remove human-readable crap from it to get xfer estimate in bytes
+$sendsize = pop(@sendsize);		
+$sendsize =~ s/^size\s*//;
+chomp $sendsize;
 
-if ($compress) { print STDERR "Using gzip stream compression...\n"; }
+if ($pv =~ /pv/) { $pv = "$pv -s $sendsize |"; }
 
-open SOURCE, "$ssh \'zfs send -R -I $sourcesnap1 $sourcesnap2 $gzip\' $zcat |"
+$TARGET = "$pv zfs receive $target";
+
+print STDERR "Effective command: $SOURCE | $TARGET\n\n";
+open SOURCE, "$SOURCE |"
         or print $! ? "Error opening zfs send: $!"
         : "Exit status $? from zfs send";
 binmode SOURCE;
 
-if ($pv =~ /pv/) { $pv = "| $pv -s $sendsize "; }
-
-open TARGET, "$pv | zfs receive $target"
+open TARGET, "| $TARGET"
         or print $! ? "Error opening zfs receive: $!"
         : "Exit status $? from zfs receive";
 binmode TARGET;
@@ -107,7 +161,7 @@ while ($bufsize = read (SOURCE, $buffer, $blocksize)) {
 	print TARGET $buffer
         	or die $! ? "Error writing to zfs receive: $!"
 	        : "Exit status $? from zfs receive";
-	
+
 	if (! ($pv =~ /pv/) ) {
 		# ugly, rough homemade progress meter
 		print STDERR "Transferred " . sprintf("%.1f",$xferred/1024/1024) . " MB (~ " . sprintf("%.2f",$xferred/$sendsize*100*.999) . "%)\n";
@@ -122,18 +176,26 @@ close TARGET
 	or print $! ? "Error closing zfs receive: $!"
 	: "Exit status $? from zfs receive";
 
-print STDERR "\n";
-
-$targetsnap2 = $sourcesnap2;
+$targetsnap2 = $newsourcesnap;
 $targetsnap2 =~ s/^.*?\@//;
 $targetsnap2 = "$target\@" . $targetsnap2;
-
 $success = `zfs list -t snap $targetsnap2`;
 
-chomp $targetsnap;
-
 if ($success) { 
-	print "Transfer complete! Updated from $targetsnap to $target\@$sourcesnapname.\n"; 
+	@newtargetsnapsraw = `zfs list -rH -t snapshot -S creation -o name`;
+	while (my $snap = pop(@newtargetsnapsraw)) {
+		if ($snap =~ /zfsync_$hostid/) { push @newtargetsnaps, $snap; }
+	}
+	$newtargetsnap = pop(@newtargetsnaps);
+	print "Transfer complete! Updated $target to $newtargetsnap.\n"; 
+	print STDERR "Pruning old zfsync snaps on source...\n";
+	foreach $snap (@prunesourcesnaps) {
+		system ("$ssh zfs destroy $snap");
+	}
+	print STDERR "Pruning old zfsync snaps on target...\n";
+	foreach $snap (@prunetargetsnaps) {
+		system ("zfs destroy $snap");
+	}
 	exit 0;
 } else { 
 	print "Transfer FAILED!  Died after transferring " . sprintf("%.1f",$xferred/1024/1024) . " of approximately " . sprintf("%.1f",$sendsize/1024/1024) . " MB. :(\n"; 
@@ -141,3 +203,17 @@ if ($success) {
 }
 
 exit;
+
+sub get_date {
+        ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+        $year = $year + 1900;
+        my $unix_time = (((((((($year - 1971) * 365) + $yday) * 24) + $hour) * 60) + $min) * 60) + $sec;
+        $sec = sprintf ("%02u", $sec);
+        $min = sprintf ("%02u", $min);
+        $hour = sprintf ("%02u", $hour);
+        $mday = sprintf ("%02u", $mday);
+        $mon = sprintf ("%02u", ($mon + 1));
+        my $datestamp = "$year-$mon-$mday:$hour:$min:$sec";
+        return ($sec,$min,$hour,$unix_time,$datestamp);
+}
+
