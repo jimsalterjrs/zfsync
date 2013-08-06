@@ -29,6 +29,16 @@ if ($source =~ /^\S*:/) {
 	$ssh = "/usr/bin/ssh -c arcfour $sourcehost";
 }
 
+# find the zfs command 
+if (-e '/sbin/zfs') { $zfs = '/sbin/zfs'; }
+elsif (-e '/bin/zfs') { $zfs = '/bin/zfs'; }
+elsif (-e '/usr/sbin/zfs') { $zfs = '/usr/sbin/zfs'; }
+elsif (-e '/usr/bin/zfs') { $zfs = '/usr/bin/zfs'; }
+elsif (-e '/usr/local/sbin/zfs') { $zfs = '/usr/local/sbin/zfs'; }
+elsif (-e '/usr/local/bin/zfs') { $zfs = '/usr/local/bin/zfs'; }
+elsif (-e '/opt/zfs') { $zfs = '/opt/zfs'; }
+elsif (-e '/usr/local/opt/zfs') { $zfs = '/usr/local/opt/zfs'; }
+
 # if we have pv available on the system, let's find it and use it.
 if (-e '/sbin/pv') { $pv = '/sbin/pv'; }
 elsif (-e '/bin/pv') { $pv = '/bin/pv'; }
@@ -46,7 +56,7 @@ my $datestamp = $dateparts[4];
 
 # get a list of zfsync snapshots from the source
 print STDERR "Getting list of snapshots from source...\n";
-@sourcesnapsraw = `$ssh zfs list -rH -t snapshot -S creation -o name $source`;
+@sourcesnapsraw = `$ssh $zfs list -rH -t snapshot -S creation -o name $source`;
 while (my $snap = pop(@sourcesnapsraw)) {
 	if ($snap =~ /zfsync_$hostid/) { push @sourcesnaps, $snap; }
 }
@@ -54,7 +64,7 @@ while (my $snap = pop(@sourcesnapsraw)) {
 @prunesourcesnaps = @sourcesnaps;
 
 # does the target exist yet?
-@targetexists = `zfs list -o name`;
+@targetexists = `$zfs list -o name`;
 while (my $snap = pop(@targetexists)) { 
 	chomp $snap;
 	if ($snap eq $target) { $targetexists=1; }
@@ -62,7 +72,7 @@ while (my $snap = pop(@targetexists)) {
 
 if ($targetexists) { 
 	print STDERR "Target exists.  Finding snapshots.\n";
-	@targetsnapsraw = `zfs list -rH -t snapshot -S creation -o name`;
+	@targetsnapsraw = `$zfs list -rH -t snapshot -S creation -o name`;
 	while (my $snap = pop(@targetsnapsraw)) {
 		if ($snap =~ /zfsync_$hostid/) { push @targetsnaps, $snap; }
 	}
@@ -73,7 +83,7 @@ if ($targetexists) {
 	# we're going to have to destroy target if we don't have any zfsync snaps on it
 	if (! $numtargetsnaps) {
 		print STDERR "No zfsync snaps on target: destroying target.\n";
-		system ("zfs destroy -r $target");
+		system ("$zfs destroy -r $target");
 		$targetexists = 0;
 	}
 }
@@ -96,7 +106,7 @@ if ($numtargetsnaps) {
 					$oldsourcesnapname = $oldsourcesnap;
 					$oldsourcesnapname =~ s/^.*?\@//;
 					print STDERR "Found matching zfsync snapshot $sourcesnapname on source and target.\n";
-					$used = `$ssh zfs diff $sourcesnap $source`;
+					$used = `$ssh $zfs diff $sourcesnap $source`;
 					if ($used eq '') {
 						print STDERR "No new data on $source since $sourcesnap - nothing to sync, exiting.\n";
 						exit;
@@ -110,7 +120,7 @@ if ($numtargetsnaps) {
 	# we're going to have to destroy target if there are no source zfsync snaps
 	if (! $matchedsnaps) {
 		print STDERR "No matching zfsync snaps between source and target: destroying target.\n";
-		system ("zfs destroy -r $target");
+		system ("$zfs destroy -r $target");
 		$targetexists = 0;
 	}
 }	
@@ -118,19 +128,19 @@ if ($numtargetsnaps) {
 # create zfsync snapshot on the source
 $newsourcesnap = "$source\@zfsync\_$hostid\_$datestamp";
 print STDERR "Creating $newsourcesnap on source...\n";
-system("$ssh zfs snapshot $newsourcesnap");
+system("$ssh $zfs snapshot $newsourcesnap");
 
 if (! $targetexists) {
 	# Woo, first sync... this'll be a hot minute, amirite?
 	print STDERR "Target does not exist - will be created with initial transfer.\n";
-	@sendsize = `$ssh zfs send -nP -R $newsourcesnap 2>&1`;
-	$SOURCE = "$ssh \'zfs send -R $newsourcesnap $gzip\' $zcat ";
+	@sendsize = `$ssh $zfs send -nP -R $newsourcesnap 2>&1`;
+	$SOURCE = "$ssh \'$zfs send -R $newsourcesnap $gzip\' $zcat ";
 } else {
 	# incremental send yo.  rollback the target to the newest matched snapshot first.
 	print STDERR "Found matching snapshots. Rolling target back to $oldsourcesnapname before transfer.\n";
-	system ("zfs rollback $target\@$oldsourcesnapname");
+	system ("$zfs rollback $target\@$oldsourcesnapname");
 	@sendsize = `$ssh zfs send -nP -R -I $oldsourcesnap $newsourcesnap 2>&1`;
-	$SOURCE = "$ssh \'zfs send -R -I $oldsourcesnap $newsourcesnap $gzip\' $zcat ";
+	$SOURCE = "$ssh \'$zfs send -R -I $oldsourcesnap $newsourcesnap $gzip\' $zcat ";
 }
 
 # process sendsize: last line is summary, remove human-readable crap from it to get xfer estimate in bytes
@@ -140,7 +150,7 @@ chomp $sendsize;
 
 if ($pv =~ /pv/) { $pv = "$pv -s $sendsize |"; }
 
-$TARGET = "$pv zfs receive $target";
+$TARGET = "$pv $zfs receive $target";
 
 print STDERR "Effective command: $SOURCE | $TARGET\n\n";
 open SOURCE, "$SOURCE |"
@@ -190,11 +200,11 @@ if ($success) {
 	print "Transfer complete! Updated $target to $newtargetsnap.\n"; 
 	print STDERR "Pruning old zfsync snaps on source...\n";
 	foreach $snap (@prunesourcesnaps) {
-		system ("$ssh zfs destroy $snap");
+		system ("$ssh $zfs destroy $snap");
 	}
 	print STDERR "Pruning old zfsync snaps on target...\n";
 	foreach $snap (@prunetargetsnaps) {
-		system ("zfs destroy $snap");
+		system ("$zfs destroy $snap");
 	}
 	exit 0;
 } else { 
