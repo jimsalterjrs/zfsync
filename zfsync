@@ -12,13 +12,23 @@
 
 use Sys::Hostname;
 
-$use_mbuffer = 1;
-$mbuffer = "/usr/bin/mbuffer -q -s 128k -m 1G";
+# Yay gzip!  Yay conserved network bandwidth! 
+# Feel free to turn this off if you hate your network.
+# And fun.  And puppies.
+$use_gz = 1;
+
+# this feature WORKS, if mbuffer is present at source and target -
+# but we aren't currently checking the source for mbuffer, and the source
+# copy of mbuffer emits a truly odious warning message about no controlling
+# terminal and no autoloader command and GLAYBN! and for the most part, for
+# zfsync's intended purpose, we shouldn't really need mbuffer.  So, disabled
+# by default - for now at least.
+$use_mbuffer = 0;
 
 $source = $ARGV[0];
 $target = $ARGV[1];
 
-if ($ARGV[2] eq '-z') {
+if ($use_gz) {
 	$compress = 1;
 	$gzip = '| /bin/gzip -3';
 	$zcat = '| /bin/zcat';
@@ -51,6 +61,19 @@ elsif (-e '/usr/local/sbin/pv') { $pv = '/usr/local/sbin/pv'; }
 elsif (-e '/usr/local/bin/pv') { $pv = '/usr/local/bin/pv'; }
 elsif (-e '/opt/pv') { $pv = '/opt/pv'; }
 elsif (-e '/usr/local/opt/pv') { $pv = '/usr/local/opt/pv'; }
+
+# if we have mbuffer available on the system, let's find it and use it.
+if (-e '/sbin/mbuffer') { $mbuffer = '/sbin/mbuffer'; }
+elsif (-e '/bin/mbuffer') { $mbuffer = '/bin/mbuffer'; }
+elsif (-e '/usr/sbin/mbuffer') { $mbuffer = '/usr/sbin/mbuffer'; }
+elsif (-e '/usr/bin/mbuffer') { $mbuffer = '/usr/bin/mbuffer'; }
+elsif (-e '/usr/local/sbin/mbuffer') { $mbuffer = '/usr/local/sbin/mbuffer'; }
+elsif (-e '/usr/local/bin/mbuffer') { $mbuffer = '/usr/local/bin/mbuffer'; }
+elsif (-e '/opt/mbuffer') { $mbuffer = '/opt/mbuffer'; }
+elsif (-e '/usr/local/opt/mbuffer') { $mbuffer = '/usr/local/opt/mbuffer'; }
+else { $use_mbuffer = 0; }
+
+$mbuffer .= ' -q -s 128k -m 1G';
 
 $hostid = hostname;
 
@@ -192,7 +215,8 @@ if ($pv =~ /pv/) { $pv = "$pv -s $sendsize |"; }
 $TARGET = "$pv $zfs receive $target";
 
 if ($use_mbuffer) {
-	$SOURCE =~ s/\' \|/ \| $mbuffer \' \| $mbuffer \|/;
+	#$SOURCE =~ s/\' /\| $mbuffer \' \| $mbuffer /;
+	$SOURCE =~ s/\' /\' \| $mbuffer /;
 }
 
 #print STDERR "\nEffective command: $SOURCE | $TARGET\n\n";
