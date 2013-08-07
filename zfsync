@@ -12,6 +12,9 @@
 
 use Sys::Hostname;
 
+$use_mbuffer = 1;
+$mbuffer = "/usr/bin/mbuffer -q -s 128k -m 1G";
+
 $source = $ARGV[0];
 $target = $ARGV[1];
 
@@ -55,13 +58,35 @@ my @dateparts = &get_date;
 my $datestamp = $dateparts[4];
 
 # get a list of zfsync snapshots from the source
-print STDERR "Getting list of snapshots from source...\n";
-@sourcesnapsraw = `$ssh $zfs list -rH -t snapshot -S creation -o name $source`;
-while (my $snap = pop(@sourcesnapsraw)) {
-	if ($snap =~ /zfsync_$hostid/) { push @sourcesnaps, $snap; }
+#print STDERR "Getting list of snapshots from source...\n";
+@sourcesnaps = `$ssh $zfs list -rH -t snapshot -o name $source`;
+
+#print "@sourcesnaps\n\n";
+
+# building a single command to get the list of creation,referenced for each snapshot on source.
+# we'll run the command on the target once it's built.
+# this avoids unnecessary SSH tunnel creation overhead.
+my $cmd;
+foreach $sourcesnap(@sourcesnaps) {
+	chomp $sourcesnap;
+	$cmd .= "$zfs get -Hp -o name,property,value creation,referenced $sourcesnap; ";
 }
-# we're going to want an extra copy of this array later, for pruning.
-@prunesourcesnaps = @sourcesnaps;
+#print STDERR "Getting details on source snapshots... ";
+@sourcesnaprawdetails = `$ssh '$cmd'`;
+#print STDERR "details received.\n";
+
+# build a hash for the source snapshot details.
+foreach $ssrow (@sourcesnaprawdetails) {
+	@ssrow = split " ",$ssrow;
+	# we only want the snapshot ID, not the zfs pathname
+	$ssrow[0] =~ s/^.*?\@//;
+	$ssdetails {$ssrow[0]}{$ssrow[1]} = $ssrow[2];
+}
+
+#print "Hash built:\n";
+#foreach $name ( sort { $ssdetails{$b}{'creation'} <=> $ssdetails{$a}{'creation'} } keys %ssdetails ) {
+#	print "name: $name creation: $ssdetails{$name}{'creation'} referenced: $ssdetails{$name}{'referenced'}\n";
+#}
 
 # does the target exist yet?
 @targetexists = `$zfs list -o name`;
@@ -71,54 +96,68 @@ while (my $snap = pop(@targetexists)) {
 }
 
 if ($targetexists) { 
-	print STDERR "Target exists.  Finding snapshots.\n";
-	@targetsnapsraw = `$zfs list -rH -t snapshot -S creation -o name`;
-	while (my $snap = pop(@targetsnapsraw)) {
-		if ($snap =~ /zfsync_$hostid/) { push @targetsnaps, $snap; }
-	}
-	# print STDERR "Found zfsync snapshots on target: \n@targetsnaps\n";
+	#print STDERR "Target exists.  Finding snapshots... ";
+	@targetsnaps = `$zfs list -rH -t snapshot -S creation -o name $target`;
 	$numtargetsnaps = scalar @targetsnaps;
-	# we're going to want an extra copy of these later, for pruning.
-	@prunetargetsnaps = @targetsnaps;
-	# we're going to have to destroy target if we don't have any zfsync snaps on it
+	#print STDERR "found $numtargetsnaps snapshots on target.\n";
+
 	if (! $numtargetsnaps) {
-		print STDERR "No zfsync snaps on target: destroying target.\n";
+		# we're going destroy target if we don't have any snapshots on it
+		print STDERR "No snapshots on target: destroying target.\n";
 		system ("$zfs destroy -r $target");
 		$targetexists = 0;
+	} else {
+		# we have snapshots, now we need details to match up with the source
+		my $cmd;
+		foreach $targetsnap (@targetsnaps) {
+		        chomp $targetsnap;
+		        $cmd .= "$zfs get -Hp -o name,property,value creation,referenced $targetsnap; ";
+		}
+
+		#print STDERR "Getting details on target snapshots... ";
+		@targetsnaprawdetails = `$cmd`;
+		#print STDERR "details received.\n";
+		
+		# build a hash for the target snapshot details.
+		foreach $tsrow (@targetsnaprawdetails) {
+		        @tsrow = split " ",$tsrow;
+			# we only want the snapshot ID, not the zfs pathname
+			$tsrow[0] =~ s/^.*?\@//;
+		        $tsdetails {$tsrow[0]}{$tsrow[1]} = $tsrow[2];
+		}
+
+		#foreach $name ( sort { $tsdetails{$b}{'creation'} <=> $tsdetails{$a}{'creation'} } keys %tsdetails ) {
+                #	print "name: $name creation: $tsdetails{$name}{'creation'} referenced: $tsdetails{$name}{'referenced'}\n";
+		#}
 	}
 }
 
 if ($numtargetsnaps) {
 	# make sure we have a snap on the source to match a targetsnap
-	print STDERR "Attempting to match zfsync snapshots on source and target.\n";
-	while (! $matchedsnaps && (my $targetsnap = pop(@targetsnaps))) {
-		chomp $targetsnap;
-		$targetsnapname = $targetsnap;
-		$targetsnapname =~ s/^.*\@//;
-		foreach $sourcesnap (@sourcesnaps) {
-			if (! $matchedsnaps) {
-				chomp $sourcesnap;
-				$sourcesnapname = $sourcesnap;
-				$sourcesnapname =~ s/^.*\@//;
-				if ($targetsnapname eq $sourcesnapname) { 
-					$matchedsnaps = 1; 
-					$oldsourcesnap = $sourcesnap; 
-					$oldsourcesnapname = $oldsourcesnap;
-					$oldsourcesnapname =~ s/^.*?\@//;
-					print STDERR "Found matching zfsync snapshot $sourcesnapname on source and target.\n";
-					$used = `$ssh $zfs diff $sourcesnap $source`;
-					if ($used eq '') {
-						print STDERR "No new data on $source since $sourcesnap - nothing to sync, exiting.\n";
-						exit;
-					} 
-				} else {
-					# print STDERR "source snap $sourcesnapname does not match target snap $targetsnapname.\n";
-				}
-			}
-		}
+	#print STDERR "Attempting to match zfsync snapshots on source and target.\n";
+	# iterate the target hash in reverse creation order (ie, newest creation first)
+	foreach $name ( sort { $tsdetails{$b}{'creation'} <=> $tsdetails{$a}{'creation'} } keys %tsdetails ) {
+	        #print "name: $name creation: $tsdetails{$name}{'creation'} referenced: $tsdetails{$name}{'referenced'}\n";
+		if (
+		     ! $matched
+		     && $tsdetails{$name}{'creation'} == $ssdetails{$name}{'creation'}
+		     && $tsdetails{$name}{'referenced'} == $ssdetails {$name}{'referenced'}
+		   ) {
+			#print STDERR "Match found: snapshot $name exists with same creation and reference on source and target.\n";
+			$matched = 1;
+			$oldsnap = $name;
+          
+			$used = `$ssh zfs diff $source\@$name $source`;
+			if ($used eq '') {
+				#print STDERR "No new data on $source since \@$name - nothing to sync, exiting.\n";
+				print STDERR "No new data on $source to sync, exiting.\n";
+				exit 0;
+			} 
+		}	
 	}
+
 	# we're going to have to destroy target if there are no source zfsync snaps
-	if (! $matchedsnaps) {
+	if (! $matched) {
 		print STDERR "No matching zfsync snaps between source and target: destroying target.\n";
 		system ("$zfs destroy -r $target");
 		$targetexists = 0;
@@ -126,21 +165,21 @@ if ($numtargetsnaps) {
 }	
 
 # create zfsync snapshot on the source
-$newsourcesnap = "$source\@zfsync\_$hostid\_$datestamp";
-print STDERR "Creating $newsourcesnap on source...\n";
-system("$ssh $zfs snapshot $newsourcesnap");
+$newsnap = "zfsync\_$hostid\_$datestamp";
+print STDERR "Creating $newsnap on $source...\n";
+system("$ssh $zfs snapshot $source\@$newsnap");
 
 if (! $targetexists) {
 	# Woo, first sync... this'll be a hot minute, amirite?
-	print STDERR "Target does not exist - will be created with initial transfer.\n";
-	@sendsize = `$ssh $zfs send -nP -R $newsourcesnap 2>&1`;
-	$SOURCE = "$ssh \'$zfs send -R $newsourcesnap $gzip\' $zcat ";
+	print STDERR "$target does not exist - will be created with initial transfer.\n";
+	@sendsize = `$ssh $zfs send -nP -R $source\@$newsnap 2>&1`;
+	$SOURCE = "$ssh \'$zfs send -R $source\@$newsnap $gzip \' $zcat ";
 } else {
 	# incremental send yo.  rollback the target to the newest matched snapshot first.
-	print STDERR "Found matching snapshots. Rolling target back to $oldsourcesnapname before transfer.\n";
-	system ("$zfs rollback $target\@$oldsourcesnapname");
-	@sendsize = `$ssh zfs send -nP -R -I $oldsourcesnap $newsourcesnap 2>&1`;
-	$SOURCE = "$ssh \'$zfs send -R -I $oldsourcesnap $newsourcesnap $gzip\' $zcat ";
+	print STDERR "Rolling $target back to \@$oldsnap before transfer.\n";
+	system ("$zfs rollback $target\@$oldsnap");
+	@sendsize = `$ssh zfs send -nP -R -I $source\@$oldsnap $source\@$newsnap 2>&1`;
+	$SOURCE = "$ssh \'$zfs send -R -I $source\@$oldsnap $source\@$newsnap $gzip \' $zcat ";
 }
 
 # process sendsize: last line is summary, remove human-readable crap from it to get xfer estimate in bytes
@@ -152,7 +191,12 @@ if ($pv =~ /pv/) { $pv = "$pv -s $sendsize |"; }
 
 $TARGET = "$pv $zfs receive $target";
 
-print STDERR "Effective command: $SOURCE | $TARGET\n\n";
+if ($use_mbuffer) {
+	$SOURCE =~ s/\' \|/ \| $mbuffer \' \| $mbuffer \|/;
+}
+
+#print STDERR "\nEffective command: $SOURCE | $TARGET\n\n";
+
 open SOURCE, "$SOURCE |"
         or print $! ? "Error opening zfs send: $!"
         : "Exit status $? from zfs send";
@@ -186,29 +230,44 @@ close TARGET
 	or print $! ? "Error closing zfs receive: $!"
 	: "Exit status $? from zfs receive";
 
-$targetsnap2 = $newsourcesnap;
-$targetsnap2 =~ s/^.*?\@//;
-$targetsnap2 = "$target\@" . $targetsnap2;
-$success = `zfs list -t snap $targetsnap2`;
+$success = `$zfs list -t snap $target\@$newsnap`;
 
 if ($success) { 
-	@newtargetsnapsraw = `zfs list -rH -t snapshot -S creation -o name`;
-	while (my $snap = pop(@newtargetsnapsraw)) {
-		if ($snap =~ /zfsync_$hostid/) { push @newtargetsnaps, $snap; }
+	#print STDERR "\nPruning old zfsync snaps on $source... ";
+	my $cmd;
+	foreach $name ( sort { $ssdetails{$b}{'creation'} <=> $ssdetails{$a}{'creation'} } keys %ssdetails ) {
+		if ($name =~ /zfsync\_$hostid/) {
+			$cmd .= "$zfs destroy $source\@$name ; ";
+		}
 	}
-	$newtargetsnap = pop(@newtargetsnaps);
-	print "Transfer complete! Updated $target to $newtargetsnap.\n"; 
-	print STDERR "Pruning old zfsync snaps on source...\n";
-	foreach $snap (@prunesourcesnaps) {
-		system ("$ssh $zfs destroy $snap");
+	system ("$ssh '$cmd'");
+	#print STDERR "old zfsync snaps on $source pruned.\n";
+
+	#print STDERR "Pruning old zfsync snaps on $target... ";
+	foreach $name ( sort { $tsdetails{$b}{'creation'} <=> $tsdetails{$a}{'creation'} } keys %tsdetails ) {
+		if ($name =~ /zfsync_$hostid/) {
+			system("$zfs destroy $target\@$name");
+		}
 	}
-	print STDERR "Pruning old zfsync snaps on target...\n";
-	foreach $snap (@prunetargetsnaps) {
-		system ("$zfs destroy $snap");
-	}
+	#print STDERR "old zfsync snaps on $target pruned.\n";
+
+	print "\nTransfer complete! Updated $target from \@$oldsnap to \@$newsnap.\n"; 
 	exit 0;
 } else { 
-	print "Transfer FAILED!  Died after transferring " . sprintf("%.1f",$xferred/1024/1024) . " of approximately " . sprintf("%.1f",$sendsize/1024/1024) . " MB. :(\n"; 
+	# well, we crashed and burned - but did we get ANY snapshots successfully replicated before we did?
+	my @newtargetsnap = `zfs list -r -t snap -o name -S creation -H $target`;
+	$newtargetsnap[0] =~ s/^.*?\@//;
+	chomp $newtargetsnap[0];
+
+	print "\nTransfer FAILED!  Died after transferring " . sprintf("%.1f",$xferred/1024/1024) . " of approximately " . sprintf("%.1f",$sendsize/1024/1024) . " MB "; 
+
+	if ($newtargetsnap[0] ne $oldsnap) {
+		# Yay, we at least managed SOME replication!
+		print "; $target was \@$oldsnap, is now \@$newtargetsnap[0].\n";
+	} else {
+		# Boo, we completely wasted our time, bandwidth, and storage load ='(
+		print ".\n";
+	}
 	exit 3;
 }
 
