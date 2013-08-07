@@ -17,13 +17,29 @@ use Sys::Hostname;
 # And fun.  And puppies.
 $use_gz = 1;
 
-# this feature WORKS, if mbuffer is present at source and target -
-# but we aren't currently checking the source for mbuffer, and the source
-# copy of mbuffer emits a truly odious warning message about no controlling
-# terminal and no autoloader command and GLAYBN! and for the most part, for
-# zfsync's intended purpose, we shouldn't really need mbuffer.  So, disabled
-# by default - for now at least.
-$use_mbuffer = 0;
+# A local copy of mbuffer really whips the llama's ass -
+# even with a mere 64M allocated, it pretty much doubled
+# a real-world replication speed of a day's worth of data
+# at roughly 1.5G total to xfer for me.
+#
+# Note: zfsync will automatically find mbuffer on the
+# local machine if it's available, and use the correct
+# path.  If you enable it here and don't actually have it,
+# zfsync will quietly disable it for you.  And curse you
+# under its breath.
+$use_local_mbuffer = 1;
+$local_mbuffer_size = '128M';
+
+# Remote mbuffer is probably not as big a win.  Over a WAN
+# link it will improve performance over local mbuffer alone,
+# but it does zero good over a LAN connection.
+# Also, ugly stupid message about tape drives, wtf.
+# And be damn careful that it both exists and you've got the
+# right path to it on your remote machine, because I have not
+# yet built in automated checks to find it!
+$use_remote_mbuffer = 1;
+$remote_mbuffer_size = '128M';
+$remote_mbuffer = "/usr/bin/mbuffer";
 
 $source = $ARGV[0];
 $target = $ARGV[1];
@@ -63,17 +79,18 @@ elsif (-e '/opt/pv') { $pv = '/opt/pv'; }
 elsif (-e '/usr/local/opt/pv') { $pv = '/usr/local/opt/pv'; }
 
 # if we have mbuffer available on the system, let's find it and use it.
-if (-e '/sbin/mbuffer') { $mbuffer = '/sbin/mbuffer'; }
-elsif (-e '/bin/mbuffer') { $mbuffer = '/bin/mbuffer'; }
-elsif (-e '/usr/sbin/mbuffer') { $mbuffer = '/usr/sbin/mbuffer'; }
-elsif (-e '/usr/bin/mbuffer') { $mbuffer = '/usr/bin/mbuffer'; }
-elsif (-e '/usr/local/sbin/mbuffer') { $mbuffer = '/usr/local/sbin/mbuffer'; }
-elsif (-e '/usr/local/bin/mbuffer') { $mbuffer = '/usr/local/bin/mbuffer'; }
-elsif (-e '/opt/mbuffer') { $mbuffer = '/opt/mbuffer'; }
-elsif (-e '/usr/local/opt/mbuffer') { $mbuffer = '/usr/local/opt/mbuffer'; }
-else { $use_mbuffer = 0; }
+if (-e '/sbin/mbuffer') { $local_mbuffer = '/sbin/mbuffer'; }
+elsif (-e '/bin/mbuffer') { $local_mbuffer = '/bin/mbuffer'; }
+elsif (-e '/usr/sbin/mbuffer') { $local_mbuffer = '/usr/sbin/mbuffer'; }
+elsif (-e '/usr/bin/mbuffer') { $local_mbuffer = '/usr/bin/mbuffer'; }
+elsif (-e '/usr/local/sbin/mbuffer') { $local_mbuffer = '/usr/local/sbin/mbuffer'; }
+elsif (-e '/usr/local/bin/mbuffer') { $local_mbuffer = '/usr/local/bin/mbuffer'; }
+elsif (-e '/opt/mbuffer') { $local_mbuffer = '/opt/mbuffer'; }
+elsif (-e '/usr/local/opt/mbuffer') { $local_mbuffer = '/usr/local/opt/mbuffer'; }
+else { $use_local_mbuffer = 0; }
 
-$mbuffer .= ' -q -s 128k -m 1G';
+$local_mbuffer .= " -q -s 128k -m $local_mbuffer_size";
+$remote_mbuffer .= " -q -s 128k -m $remote_mbuffer_size";
 
 $hostid = hostname;
 
@@ -215,9 +232,12 @@ if ($pv =~ /pv/) { $pv = "$pv -s $sendsize |"; }
 
 $TARGET = "$pv $zfs receive $target";
 
-if ($use_mbuffer) {
-	#$SOURCE =~ s/\' /\| $mbuffer \' \| $mbuffer /;
-	$SOURCE =~ s/\' /\' \| $mbuffer /;
+if ($use_local_mbuffer) {
+	$SOURCE =~ s/\' /\' \| $local_mbuffer /;
+}
+
+if ($use_remote_mbuffer) {
+	$SOURCE =~ s/\' /\| $remote_mbuffer \' /;
 }
 
 #print STDERR "\nEffective command: $SOURCE | $TARGET\n\n";
@@ -234,6 +254,8 @@ binmode TARGET;
 
 $blocksize = 65536;
 #$blocksize = 1048576;
+
+print STDERR "Transferring approximately " . sprintf("%.1f",$sendsize/1024/1024) . " MB...\n\n";
 
 while ($bufsize = read (SOURCE, $buffer, $blocksize)) {
 	$xferred += $bufsize;
