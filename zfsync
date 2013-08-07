@@ -164,9 +164,9 @@ if ($numtargetsnaps) {
 		if (
 		     ! $matched
 		     && $tsdetails{$name}{'creation'} == $ssdetails{$name}{'creation'}
-		     && $tsdetails{$name}{'referenced'} == $ssdetails {$name}{'referenced'}
+		     #&& $tsdetails{$name}{'referenced'} == $ssdetails {$name}{'referenced'}
 		   ) {
-			#print STDERR "Match found: snapshot $name exists with same creation and reference on source and target.\n";
+			#print STDERR "Match found: snapshot $name exists with same creation on source and target.\n";
 			$matched = 1;
 			$oldsnap = $name;
           
@@ -181,7 +181,8 @@ if ($numtargetsnaps) {
 
 	# we're going to have to destroy target if there are no source zfsync snaps
 	if (! $matched) {
-		print STDERR "No matching zfsync snaps between source and target: destroying target.\n";
+		print STDERR "No matching zfsync snaps between source and target: committing seppuku now.\n";
+		exit 3;
 		system ("$zfs destroy -r $target");
 		$targetexists = 0;
 	}
