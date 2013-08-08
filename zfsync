@@ -358,7 +358,7 @@ sub prune_zfsync_snapshots {
 	
 	my $cmd;
 	my $skippedthefirst=0;
-	foreach my $name ( sort { $sdetails{$a}{'creation'} <=> $sdetails{$b}{'creation'} } keys %sdetails ) {
+	foreach my $name ( sort { $sdetails{$b}{'creation'} <=> $sdetails{$a}{'creation'} } keys %sdetails ) {
 		if ($name =~ /zfsync\_$hostid/) {
 			if ($skippedthefirst) { $cmd .= "$zfs destroy $system\@$name ; "; } else { $skippedthefirst = 1; }
 		}
