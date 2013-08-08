@@ -199,7 +199,7 @@ if ($targetexists && $numtargetsnaps) {
 
 	# if we DO have snapshots on the target, but none of them match the source, let's just die honorably now. ='(
 	if (! $matched) {
-		print STDERR "No matching zfsync snaps between source and target: committing seppuku now.\n";
+		print STDERR "FAILURE: no matching zfsync snaps between source and target: committing seppuku now.\n";
 		exit 3;
 	}
 }	
@@ -305,7 +305,7 @@ $success = `$zfs list -t snap $target\@$newsnap`;
 if ($success) { 
 	&prune_zfsync_snapshots ($zfs,$ssh,$source);
 	&prune_zfsync_snapshots ($zfs,'',$target);
-	print "\nTransfer complete! Updated $target from \@$oldsnap to \@$newsnap.\n"; 
+	print "\nSUCCESS: Updated $target from \@$oldsnap to \@$newsnap.\n"; 
 	exit 0;
 } else { 
 	# well, we crashed and burned - but did we get ANY snapshots successfully replicated before we did?
