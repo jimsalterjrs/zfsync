@@ -215,7 +215,6 @@ if ( $targetexists
 }
 
 my @sendsize;
-my $sendsize;
 my $SOURCE;
 if ($targetexists) {
 	@sendsize = `$ssh zfs send -nP -R -I $source\@$oldsnap $source\@$newsnap 2>&1`;
@@ -230,17 +229,23 @@ if ($targetexists) {
 # process sendsize: last line of multi-line output is 
 # size of proposed xfer in bytes, but we need to remove 
 # human-readable crap from it 
-$sendsize = pop(@sendsize);		
+my $sendsize = pop(@sendsize);		
 $sendsize =~ s/^size\s*//;
 chomp $sendsize;
+my $disp_sendsize;
+if ($sendsize > 1024*1024*1024) {
+	$disp_sendsize = sprintf("%.1f",$sendsize/1024/1024/1024) . ' GB';
+} elsif ($sendsize > 1024*1024) {
+	$disp_sendsize = sprintf("%.1f",$sendsize/1024/1024) . ' MB';
+} else {
+	$disp_sendsize = sprintf("%d",$sendsize/1024) . ' KB';
+}
 
 if ($targetexists) {
 	# do we have enough space to accommodate the new snapshots?  If not, die honorably ='(
 	my $free_space = (`$zfs get -Hp available -o value $target`);  # bytes
 	if ($sendsize > $free_space) { 
-		my $disp_sendsize = sprintf("%.2F",$sendsize/1024/1024/1024);
-		print "FAILURE: Not enough space on $target for $disp_sendsize";
-		print "G of data from $sourcehost:$source... exiting.\n";
+		print "FAILURE: Not enough space on $target for $disp_sendsize of data from $sourcehost:$source... exiting.\n";
 		# Let's clean up the unnecessary zfsync snapshot we created on the source
 		# before seppuku is final, shall we?
 		system ("$ssh '$zfs destroy $source\@$newsnap'");
@@ -269,60 +274,71 @@ if ($use_remote_mbuffer) {
 
 open SOURCE, "$SOURCE |"
         or print $! ? "Error opening zfs send: $!"
-        : "Exit status $? from zfs send";
+        : "Exit status $? from zfs send\n";
 binmode SOURCE;
 
 open TARGET, "| $TARGET"
         or print $! ? "Error opening zfs receive: $!"
-        : "Exit status $? from zfs receive";
+        : "Exit status $? from zfs receive\n";
 binmode TARGET;
 
 my $blocksize = 65536;   # 64K - increasing blocksize substantially may improve performance on a LAN
 
-print STDERR "Transferring approximately " . sprintf("%.1f",$sendsize/1024/1024) . " MB...\n\n";
+print STDERR "Transferring approximately $disp_sendsize ...\n\n";
 my $xferred;
 while (my $bufsize = read (SOURCE, my $buffer, $blocksize)) {
 	$xferred += $bufsize;
+
+	if ($xferred > 1024*1024*1024) {
+		$disp_xferred = sprintf("%.1f",$xferred/1024/1024/1024) . ' GB';
+	} elsif ($xferred > 1024*1024) {
+		$disp_xferred = sprintf("%.1f",$xferred/1024/1024) . ' MB';
+	} else {
+		$disp_xferred = sprintf("%d",$xferred/1024) . ' KB';
+	}
+
 	print TARGET $buffer
         	or die $! ? "Error writing to zfs receive: $!"
 	        : "Exit status $? from zfs receive";
 
 	if (! ($pv =~ /pv/) ) {
 		# ugly, rough homemade progress meter
-		print STDERR "Transferred " . sprintf("%.1f",$xferred/1024/1024) . " MB (~ " . sprintf("%.2f",$xferred/$sendsize*100*.999) . "%)\n";
+		print STDERR "Transferred $disp_xferred (~ " . sprintf("%.2f",$xferred/$sendsize*100*.999) . "%)\n";
 		print STDERR "\e[A";
 	}
 }
 
 close SOURCE
 	or print $! ? "Error closing zfs send: $!"
-	: "Exit status $? from zfs send";
+	: "Exit status $? from zfs send\n";
 close TARGET
 	or print $! ? "Error closing zfs receive: $!"
-	: "Exit status $? from zfs receive";
+	: "Exit status $? from zfs receive\n";
 
 $success = `$zfs list -t snap $target\@$newsnap`;
 
 if ($success) { 
 	&prune_zfsync_snapshots ($zfs,$ssh,$source);
 	&prune_zfsync_snapshots ($zfs,'',$target);
-	print "SUCCESS: Updated $target from \@$oldsnap to \@$newsnap.\n"; 
+	print "SUCCESS: Updated $target from \@$oldsnap to \@$newsnap ($disp_xferred transferred)\n"; 
 	exit 0;
 } else { 
 	# well, we crashed and burned - but did we get ANY snapshots successfully replicated before we did?
-	my @newtargetsnap = `zfs list -r -t snap -o name -S creation -H $target`;
-	$newtargetsnap[0] =~ s/^.*?\@//;
-	chomp $newtargetsnap[0];
+	my @newtargetsnaps = `zfs list -r -t snap -o name -s creation -H $target`;
+	my $newtargetsnap = pop @newtargetsnaps;
+	$newtargetsnap =~ s/^.*?\@//;
+	chomp $newtargetsnap;
 
-	print "FAILURE:  Died after transferring " . sprintf("%.1f",$xferred/1024/1024) . " of approximately " . sprintf("%.1f",$sendsize/1024/1024) . " MB "; 
+	print "FAILURE: ";
 
-	if ($newtargetsnap[0] ne $oldsnap) {
+	if ($newtargetsnap ne $oldsnap) {
 		# Yay, we at least managed SOME replication!
-		print "; $target was \@$oldsnap, is now \@$newtargetsnap[0].\n";
+		print "successfully updated $target\@$oldsnap as far as \@$newtargetsnap but ";
 	} else {
 		# Boo, we completely wasted our time, bandwidth, and storage load ='(
-		print ".\n";
+		print "no successful updates, ";
 	}
+	print "died after transferring $disp_xferred of approximately $disp_sendsize"; 
 	# Let's clean up the unnecessary zfsync snapshot we created on the source
 	# before seppuku is final, shall we?
 	system ("$ssh '$zfs destroy $source\@$newsnap'");
