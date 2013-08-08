@@ -139,7 +139,7 @@ my $datestamp = $dateparts[4];
 my $newsnap = "zfsync\_$hostid\_$datestamp";
 print STDERR "Creating $newsnap on $source... ";
 system("$ssh $zfs snapshot $source\@$newsnap");
-print STDERR "$source\@$newsnap created.\n";
+print STDERR "created.\n";
 
 # get a list of snapshots from the source, including the
 # one we just created
@@ -175,6 +175,7 @@ if ($targetexists) {
 
 # make sure we have a snap on the source to match a targetsnap
 my $matched = 0;
+my $oldsnap;
 if ($targetexists && $numtargetsnaps) {
 	#print STDERR "Attempting to match zfsync snapshots on source and target.\n";
 	# iterate the target hash in reverse creation order (ie, newest creation first)
@@ -187,9 +188,8 @@ if ($targetexists && $numtargetsnaps) {
 			$matched = 1;
 			$oldsnap = $name;
           
-			$used = `$ssh $zfs diff $source\@$oldsnap $source`;
+			my $used = `$ssh $zfs diff $source\@$oldsnap $source`;
 			if ($used eq '') {
-				#print STDERR "No new data on $source since \@$name - nothing to sync, exiting.\n";
 				print STDERR "No new data on $source to sync, exiting.\n";
 				exit 0;
 			} 
@@ -215,11 +215,7 @@ if ( $targetexists
 my @sendsize;
 my $sendsize;
 my $SOURCE;
-my $TARGET;
 if ($targetexists) {
-	# incremental send yo.  rollback the target to the newest matched snapshot first.
-	print STDERR "Rolling $target back to \@$oldsnap before transfer.\n";
-	system ("$zfs rollback -r $target\@$oldsnap");
 	@sendsize = `$ssh zfs send -nP -R -I $source\@$oldsnap $source\@$newsnap 2>&1`;
 	$SOURCE = "$ssh \'$zfs send -R -I $source\@$oldsnap $source\@$newsnap $gzip \' $zcat ";
 } else {
@@ -229,14 +225,35 @@ if ($targetexists) {
 	$SOURCE = "$ssh \'$zfs send -R $source\@$newsnap $gzip \' $zcat ";
 }
 
-# process sendsize: last line is summary, remove human-readable crap from it to get xfer estimate in bytes
+# process sendsize: last line of multi-line output is 
+# size of proposed xfer in bytes, but we need to remove 
+# human-readable crap from it 
 $sendsize = pop(@sendsize);		
 $sendsize =~ s/^size\s*//;
 chomp $sendsize;
 
+if ($targetexists) {
+	# do we have enough space to accommodate the new snapshots?  If not, die honorably ='(
+	my $free_space = (`$zfs get -Hp available -o value $target`);  # bytes
+	if ($sendsize > $free_space) { 
+		my $disp_sendsize = sprintf("%.2F",$sendsize/1024/1024/1024);
+		print "FAILURE: Not enough space on $target for $disp_sendsize";
+		print "G of data from $sourcehost:$source... exiting.\n";
+		# Let's clean up the unnecessary zfsync snapshot we created on the source
+		# before seppuku is final, shall we?
+		system ("$ssh '$zfs destroy $source\@$newsnap'");
+		exit 4;
+	} else {
+		# enough free space, and it's an incremental send yo.  
+		# let's rollback the target to the newest matched snapshot first.
+		print STDERR "Rolling back to $target\@$oldsnap before transfer.\n";
+		system ("$zfs rollback -r $target\@$oldsnap");
+	}
+}
+
 if ($pv =~ /pv/) { $pv = "$pv -s $sendsize |"; }
 
-$TARGET = "$pv $zfs receive $target";
+my $TARGET = "$pv $zfs receive $target";
 
 if ($use_local_mbuffer) {
 	$SOURCE =~ s/\' /\' \| $local_mbuffer /;
@@ -285,10 +302,8 @@ close TARGET
 $success = `$zfs list -t snap $target\@$newsnap`;
 
 if ($success) { 
-	#print STDERR "\nPruning old zfsync snapshots... ";
 	&prune_zfsync_snapshots ($zfs,$ssh,$source);
 	&prune_zfsync_snapshots ($zfs,'',$target);
-
 	print "\nTransfer complete! Updated $target from \@$oldsnap to \@$newsnap.\n"; 
 	exit 0;
 } else { 
@@ -297,7 +312,7 @@ if ($success) {
 	$newtargetsnap[0] =~ s/^.*?\@//;
 	chomp $newtargetsnap[0];
 
-	print "\nTransfer FAILED!  Died after transferring " . sprintf("%.1f",$xferred/1024/1024) . " of approximately " . sprintf("%.1f",$sendsize/1024/1024) . " MB "; 
+	print "\nFAILURE:  Died after transferring " . sprintf("%.1f",$xferred/1024/1024) . " of approximately " . sprintf("%.1f",$sendsize/1024/1024) . " MB "; 
 
 	if ($newtargetsnap[0] ne $oldsnap) {
 		# Yay, we at least managed SOME replication!
@@ -306,10 +321,15 @@ if ($success) {
 		# Boo, we completely wasted our time, bandwidth, and storage load ='(
 		print ".\n";
 	}
+	# Let's clean up the unnecessary zfsync snapshot we created on the source
+	# before seppuku is final, shall we?
+	system ("$ssh '$zfs destroy $source\@$newsnap'");
 	exit 3;
 }
 
-exit 0;
+exit 256; # this should NEVAR EVAR HAPPEN! =)
+
+########### begin subroutines below ##############
 
 sub get_date {
         my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
@@ -435,12 +455,12 @@ sub prune {
 	if ($zfs_target eq '') { die "Please specify a ZFS target to prune.\n"; }
 	if ($min_free_percentage eq '') { die "Please specify a minimum free percentage.\n"; }
 		
-	my $free_space = (`$zfs_cmd get -Hp available -o value $zfs_target`)/1024;
-	my $disp_free_space = sprintf("%.2f", ($free_space/1024/1024)) . 'G';
-	my $mirror_size = (`$zfs_cmd get -Hp usedbydataset -o value $zfs_target`)/1024;
-	my $filesystem_size = (`$zfs_cmd get -Hp used -o value $zfs_target`)/1024 + $free_space;
+	my $free_space = (`$zfs_cmd get -Hp available -o value $zfs_target`);
+	my $disp_free_space = sprintf("%.2f", ($free_space/1024/1024/1024)) . 'G';
+	my $mirror_size = (`$zfs_cmd get -Hp usedbydataset -o value $zfs_target`);
+	my $filesystem_size = (`$zfs_cmd get -Hp used -o value $zfs_target`) + $free_space;
 	my $min_free_space = $filesystem_size * $min_free_percentage;
-	my $disp_min_free_space = sprintf("%.2f", $min_free_space/1024/1024) . 'G';
+	my $disp_min_free_space = sprintf("%.2f", $min_free_space/1024/1024/1024) . 'G';
 	my $percent_free = sprintf("%.2f", ($free_space / $filesystem_size * 100));
 	
 	if ($free_space >= $min_free_space) {
@@ -467,9 +487,9 @@ sub prune {
 	        system ("$zfs_cmd destroy -rR $next_snapshot") ;
 	                # or die "could not prune $next_snapshot: $?"
 	        $snapshot_count += -1;
-		$free_space = (`$zfs_cmd get -Hp available -o value $zfs_target`)/1024;
+		$free_space = (`$zfs_cmd get -Hp available -o value $zfs_target`);
 		$percent_free = sprintf("%.2f", ($free_space / $filesystem_size * 100));
-		$disp_free_space = sprintf("%.2f", ($free_space/1024/1024)) . 'G';
+		$disp_free_space = sprintf("%.2f", ($free_space/1024/1024/1024)) . 'G';
 	}
 	
 	if ($free_space >= $min_free_space) {
