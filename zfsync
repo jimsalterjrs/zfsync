@@ -1,7 +1,9 @@
 #! /usr/bin/perl
 
-## zfsync - synchronize latest snapshot from a source to a target using ZFS incremental rollup snapshots (zfs send -R -I).
-
+## zfsync - synchronize new snapshots from a remote source 
+## to a local target using SSH transport and ZFS incremental 
+## rollup snapshots (zfs send -R -I).
+##
 ## syntax: zfsync [user@]host:source target [minpercentfree]
 ##
 ## zfsync currently REQUIRES SSH transport for the source
@@ -33,64 +35,66 @@
 require IO::Handle;
 use Sys::Hostname;
 
-# Yay gzip!  Yay conserved network bandwidth! 
-# Feel free to turn this off if you hate your network.
-# And fun.  And puppies.
-my $use_gz = 1;
-
-# A local copy of mbuffer really whips the llama's ass -
-# even with a mere 64M allocated, it pretty much doubled
-# real-world replication speed across a gigabit LAN for 
-# me.
-#
-# Note: zfsync will automatically find mbuffer on the
-# local machine if it's available, and use the correct
-# path.  If you enable it here and don't actually have it,
-# zfsync will quietly disable it for you.  And curse you
-# under its breath.
-my $use_local_mbuffer = 1;
-my $local_mbuffer_size = '128M';
-
-# Remote mbuffer is probably not as big a win.  Over a WAN
-# link it will improve performance over local mbuffer alone,
-# but it does zero good over a LAN connection.
-# Also, ugly stupid message about tape drives, wtf.
-#
-# And be damn careful that it both exists and you've got the
-# right path to it on your remote machine, because I have not
-# yet built in automated checks to find it!
-#
-# Disabled by default, until I build in checks to find
-# it automatically on the remote host.
-my $use_remote_mbuffer = 0;
-my $remote_mbuffer_size = '128M';
-my $remote_mbuffer = "/usr/bin/mbuffer";
-
-my $source 	= $ARGV[0];
-my $target 	= $ARGV[1];
+my $source = $ARGV[0];
+my $target = $ARGV[1];
 my $min_free_space = $ARGV[2];
 
 # default 10% minimum free space required
 if ($min_free_space eq '') { $min_free_space = 0.1; }
 
-my $compress; my $gzip; my $zcat;
+# Yay gzip!  Yay conserved network bandwidth! Feel free to 
+# disable if you hate your network.  And fun.  And puppies.
+my $use_gz = 1;
+
+# A local copy of mbuffer really whips the llama's ass -
+# even with a mere 64M allocated, it came close to doubling
+# my real-world replication speed across a gigabit LAN.
+my $use_local_mbuffer = 1;
+my $local_mbuffer_size = '128M';
+
+# Arcfour encryption DRASTICALLY speeds up SSH transport.
+# Disable this if you hate your CPU, and love long sync
+# times.  (Or if your tinfoil hat tells you that the
+# NSA is, like, totally MITMing you with arcfour but you
+# WILL BE SO SUPER SAFE YOU GUYS with some other cipher.
+my $cipher = "-c arcfour";
+
+# Remote mbuffer is probably not as big a win.  Over a WAN
+# link it will improve performance over local mbuffer alone,
+# but it does zero good over a LAN connection.  Also, mbuffer
+# invoked via SSH spams us with ugly stupid message about 
+# tape drives. That can't be turned off.  WTF.
+#
+# Disabled by default, at least until I build in checks to find
+# it automatically on the remote host.
+my $use_remote_mbuffer = 0;
+my $remote_mbuffer_size = '128M';
+my $remote_mbuffer = "/usr/bin/mbuffer";
+
+my $compress; 
+my $gzip; 
+my $zcat;
 if ($use_gz) {
 	$compress = 1;
 	$gzip = '| /bin/gzip -3';
 	$zcat = '| /bin/zcat';
 }
 
-my $sourcehost; my $ssh;
+my $sourcehost; 
+my $ssh;
 if ($source =~ /^\S*:/) {
-	# ssh source
 	$sourcehost = $source;
 	$sourcehost =~ s/:.*$//;
 	$source =~ s/^\S*://;
-	$ssh = "/usr/bin/ssh -c arcfour $sourcehost";
+	if ( ($cipher ne '') && 		# fix $cipher to -c $cipher
+	   (!($cipher =~ /^\s*-c/)) ) { 	# if not already
+		$cipher = '-c ' . $cipher; 	# written that way
+	}
+	$ssh = "/usr/bin/ssh $cipher $sourcehost";
 }
 
+# find the local zfs command 
 my $zfs;
-# find the zfs command 
 if (-e '/sbin/zfs') { $zfs = '/sbin/zfs'; }
 elsif (-e '/bin/zfs') { $zfs = '/bin/zfs'; }
 elsif (-e '/usr/sbin/zfs') { $zfs = '/usr/sbin/zfs'; }
@@ -100,8 +104,8 @@ elsif (-e '/usr/local/bin/zfs') { $zfs = '/usr/local/bin/zfs'; }
 elsif (-e '/opt/zfs') { $zfs = '/opt/zfs'; }
 elsif (-e '/usr/local/opt/zfs') { $zfs = '/usr/local/opt/zfs'; }
 
-my $pv;
 # if we have pv available on the system, let's find it and use it.
+my $pv;
 if (-e '/sbin/pv') { $pv = '/sbin/pv'; }
 elsif (-e '/bin/pv') { $pv = '/bin/pv'; }
 elsif (-e '/usr/sbin/pv') { $pv = '/usr/sbin/pv'; }
@@ -111,9 +115,9 @@ elsif (-e '/usr/local/bin/pv') { $pv = '/usr/local/bin/pv'; }
 elsif (-e '/opt/pv') { $pv = '/opt/pv'; }
 elsif (-e '/usr/local/opt/pv') { $pv = '/usr/local/opt/pv'; }
 
+# if we have mbuffer available on the system, let's find it and use it.
 my $local_mbuffer;
 my $remote_mbuffer;
-# if we have mbuffer available on the system, let's find it and use it.
 if (-e '/sbin/mbuffer') { $local_mbuffer = '/sbin/mbuffer'; }
 elsif (-e '/bin/mbuffer') { $local_mbuffer = '/bin/mbuffer'; }
 elsif (-e '/usr/sbin/mbuffer') { $local_mbuffer = '/usr/sbin/mbuffer'; }
@@ -124,18 +128,18 @@ elsif (-e '/opt/mbuffer') { $local_mbuffer = '/opt/mbuffer'; }
 elsif (-e '/usr/local/opt/mbuffer') { $local_mbuffer = '/usr/local/opt/mbuffer'; }
 else { $use_local_mbuffer = 0; }
 
+# reasonable defaults to mbuffer... not so sure the -s 128k is a win, though?
 $local_mbuffer .= " -q -s 128k -m $local_mbuffer_size";
 $remote_mbuffer .= " -q -s 128k -m $remote_mbuffer_size";
 
+# create zfsync snapshot on the source
 my $hostid = hostname;
-
 my @dateparts = &get_date;
 my $datestamp = $dateparts[4];
-
-# create zfsync snapshot on the source
-$newsnap = "zfsync\_$hostid\_$datestamp";
-print STDERR "Creating $newsnap on $source...\n";
+my $newsnap = "zfsync\_$hostid\_$datestamp";
+print STDERR "Creating $newsnap on $source... ";
 system("$ssh $zfs snapshot $source\@$newsnap");
+print STDERR "$source\@$newsnap created.\n";
 
 # get a list of snapshots from the source, including the
 # one we just created
