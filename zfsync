@@ -306,7 +306,7 @@ $success = `$zfs list -t snap $target\@$newsnap`;
 if ($success) { 
 	&prune_zfsync_snapshots ($zfs,$ssh,$source);
 	&prune_zfsync_snapshots ($zfs,'',$target);
-	print "\nSUCCESS: Updated $target from \@$oldsnap to \@$newsnap.\n"; 
+	print "SUCCESS: Updated $target from \@$oldsnap to \@$newsnap.\n"; 
 	exit 0;
 } else { 
 	# well, we crashed and burned - but did we get ANY snapshots successfully replicated before we did?
@@ -314,7 +314,7 @@ if ($success) {
 	$newtargetsnap[0] =~ s/^.*?\@//;
 	chomp $newtargetsnap[0];
 
-	print "\nFAILURE:  Died after transferring " . sprintf("%.1f",$xferred/1024/1024) . " of approximately " . sprintf("%.1f",$sendsize/1024/1024) . " MB "; 
+	print "FAILURE:  Died after transferring " . sprintf("%.1f",$xferred/1024/1024) . " of approximately " . sprintf("%.1f",$sendsize/1024/1024) . " MB "; 
 
 	if ($newtargetsnap[0] ne $oldsnap) {
 		# Yay, we at least managed SOME replication!
