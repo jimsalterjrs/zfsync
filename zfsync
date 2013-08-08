@@ -191,7 +191,7 @@ if ($targetexists && $numtargetsnaps) {
           
 			my $used = `$ssh $zfs diff $source\@$oldsnap $source`;
 			if ($used eq '') {
-				print STDERR "No new data on $source to sync, exiting.\n";
+				print "SUCCESS: No new data on $source to sync, exiting.\n";
 				exit 0;
 			} 
 		}	
@@ -199,7 +199,7 @@ if ($targetexists && $numtargetsnaps) {
 
 	# if we DO have snapshots on the target, but none of them match the source, let's just die honorably now. ='(
 	if (! $matched) {
-		print STDERR "FAILURE: no matching zfsync snaps between source and target: committing seppuku now.\n";
+		print "FAILURE: no matching zfsync snaps between source and target: committing seppuku now.\n";
 		exit 3;
 	}
 }	
@@ -210,7 +210,8 @@ if ( $targetexists
      && (! &prune ($zfs,$target,$min_free_space)) 
    ) {
 	# We couldn't make enough free space - die with honor. ='(
-	die "All but one non-zfsync snapshots pruned, still less than " . $min_free_space * 100 . "% free.  Exiting.\n";
+	print "FAILURE: all but one non-zfsync snapshots pruned, still less than " . $min_free_space * 100 . "% free.  Exiting.\n";
+	exit 5;
 }
 
 my @sendsize;
