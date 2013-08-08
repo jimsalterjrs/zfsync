@@ -2,11 +2,26 @@
 
 ## zfsync - synchronize latest snapshot from a source to a target using ZFS incremental rollup snapshots (zfs send -R -I).
 
-## temp format: zfsync [user@]host:source target [minpercentfree]
+## syntax: zfsync [user@]host:source target [minpercentfree]
 ##
 ## zfsync currently REQUIRES SSH transport for the source
 ## and CANNOT use SSH transport for the target - ie "pull"
 ## backups only, no push.
+##
+## zfsync will create snapshots on the source in the form
+## @zfsync_remotehostname_timestamp.  This allows you to
+## use zfsync to sync the same source to multiple targets
+## without the targets stomping on each others' snapshots.
+##
+## zfsync will use ANY matching snapshots between target
+## and source, not just zfsync snapshots.  This allows, for
+## example, incremental progress from overall failed zfsync
+## runs - if you have hourly snapshots on the source and run
+## zfsync once per day, a daily zfsync run that crashes or 
+## is killed halfway through will have probably successfully
+## replicated 12 of the 24 hourly snapshots, and the next 
+## zfsync run can pick up from the latest one instead of 
+## starting all over from the last zfsync_remotehost snapshot.
 ##
 ## [minpercentfree] is the minimum percentage of the target
 ## which must be free before replication will occur.  zfsync
@@ -14,55 +29,58 @@
 ## in order to try to create this space, and die if there
 ## still isn't enough after all but one (non-zfsync) snapshot
 ## have been pruned.  If not specified, 0.1 (10%) is assumed.
-##
-## example: zfsync root@localhost:locutus/source locutus/target
 
-# require IO::Handle;
-
+require IO::Handle;
 use Sys::Hostname;
 
 # Yay gzip!  Yay conserved network bandwidth! 
 # Feel free to turn this off if you hate your network.
 # And fun.  And puppies.
-$use_gz = 1;
+my $use_gz = 1;
 
 # A local copy of mbuffer really whips the llama's ass -
 # even with a mere 64M allocated, it pretty much doubled
-# a real-world replication speed of a day's worth of data
-# at roughly 1.5G total to xfer for me.
+# real-world replication speed across a gigabit LAN for 
+# me.
 #
 # Note: zfsync will automatically find mbuffer on the
 # local machine if it's available, and use the correct
 # path.  If you enable it here and don't actually have it,
 # zfsync will quietly disable it for you.  And curse you
 # under its breath.
-$use_local_mbuffer = 1;
-$local_mbuffer_size = '128M';
+my $use_local_mbuffer = 1;
+my $local_mbuffer_size = '128M';
 
 # Remote mbuffer is probably not as big a win.  Over a WAN
 # link it will improve performance over local mbuffer alone,
 # but it does zero good over a LAN connection.
 # Also, ugly stupid message about tape drives, wtf.
+#
 # And be damn careful that it both exists and you've got the
 # right path to it on your remote machine, because I have not
 # yet built in automated checks to find it!
-$use_remote_mbuffer = 1;
-$remote_mbuffer_size = '128M';
-$remote_mbuffer = "/usr/bin/mbuffer";
+#
+# Disabled by default, until I build in checks to find
+# it automatically on the remote host.
+my $use_remote_mbuffer = 0;
+my $remote_mbuffer_size = '128M';
+my $remote_mbuffer = "/usr/bin/mbuffer";
 
-$source 	= $ARGV[0];
-$target 	= $ARGV[1];
-$min_free_space = $ARGV[2];
+my $source 	= $ARGV[0];
+my $target 	= $ARGV[1];
+my $min_free_space = $ARGV[2];
 
 # default 10% minimum free space required
 if ($min_free_space eq '') { $min_free_space = 0.1; }
 
+my $compress; my $gzip; my $zcat;
 if ($use_gz) {
 	$compress = 1;
 	$gzip = '| /bin/gzip -3';
 	$zcat = '| /bin/zcat';
 }
 
+my $sourcehost; my $ssh;
 if ($source =~ /^\S*:/) {
 	# ssh source
 	$sourcehost = $source;
@@ -71,6 +89,7 @@ if ($source =~ /^\S*:/) {
 	$ssh = "/usr/bin/ssh -c arcfour $sourcehost";
 }
 
+my $zfs;
 # find the zfs command 
 if (-e '/sbin/zfs') { $zfs = '/sbin/zfs'; }
 elsif (-e '/bin/zfs') { $zfs = '/bin/zfs'; }
@@ -81,6 +100,7 @@ elsif (-e '/usr/local/bin/zfs') { $zfs = '/usr/local/bin/zfs'; }
 elsif (-e '/opt/zfs') { $zfs = '/opt/zfs'; }
 elsif (-e '/usr/local/opt/zfs') { $zfs = '/usr/local/opt/zfs'; }
 
+my $pv;
 # if we have pv available on the system, let's find it and use it.
 if (-e '/sbin/pv') { $pv = '/sbin/pv'; }
 elsif (-e '/bin/pv') { $pv = '/bin/pv'; }
@@ -91,6 +111,8 @@ elsif (-e '/usr/local/bin/pv') { $pv = '/usr/local/bin/pv'; }
 elsif (-e '/opt/pv') { $pv = '/opt/pv'; }
 elsif (-e '/usr/local/opt/pv') { $pv = '/usr/local/opt/pv'; }
 
+my $local_mbuffer;
+my $remote_mbuffer;
 # if we have mbuffer available on the system, let's find it and use it.
 if (-e '/sbin/mbuffer') { $local_mbuffer = '/sbin/mbuffer'; }
 elsif (-e '/bin/mbuffer') { $local_mbuffer = '/bin/mbuffer'; }
@@ -105,7 +127,7 @@ else { $use_local_mbuffer = 0; }
 $local_mbuffer .= " -q -s 128k -m $local_mbuffer_size";
 $remote_mbuffer .= " -q -s 128k -m $remote_mbuffer_size";
 
-$hostid = hostname;
+my $hostid = hostname;
 
 my @dateparts = &get_date;
 my $datestamp = $dateparts[4];
@@ -127,6 +149,9 @@ while ( my $snap = pop(@targetexists) ) {
 	if ($snap eq $target) { $targetexists=1; }
 }
 
+my @targetsnaps;
+my $numtargetsnaps;
+my %tsdetails;
 if ($targetexists) { 
 	#print STDERR "Target exists.  Finding snapshots... ";
 	@targetsnaps = `$zfs list -rH -t snapshot -S creation -o name $target`;
@@ -183,6 +208,10 @@ if ( $targetexists
 	die "All but one non-zfsync snapshots pruned, still less than " . $min_free_space * 100 . "% free.  Exiting.\n";
 }
 
+my @sendsize;
+my $sendsize;
+my $SOURCE;
+my $TARGET;
 if ($targetexists) {
 	# incremental send yo.  rollback the target to the newest matched snapshot first.
 	print STDERR "Rolling $target back to \@$oldsnap before transfer.\n";
@@ -225,12 +254,11 @@ open TARGET, "| $TARGET"
         : "Exit status $? from zfs receive";
 binmode TARGET;
 
-$blocksize = 65536;
-#$blocksize = 1048576;
+my $blocksize = 65536;   # 64K - increasing blocksize substantially may improve performance on a LAN
 
 print STDERR "Transferring approximately " . sprintf("%.1f",$sendsize/1024/1024) . " MB...\n\n";
-
-while ($bufsize = read (SOURCE, $buffer, $blocksize)) {
+my $xferred;
+while (my $bufsize = read (SOURCE, my $buffer, $blocksize)) {
 	$xferred += $bufsize;
 	print TARGET $buffer
         	or die $! ? "Error writing to zfs receive: $!"
@@ -280,7 +308,7 @@ if ($success) {
 exit 0;
 
 sub get_date {
-        ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
+        my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
         $year = $year + 1900;
         my $unix_time = (((((((($year - 1971) * 365) + $yday) * 24) + $hour) * 60) + $min) * 60) + $sec;
         $sec = sprintf ("%02u", $sec);
