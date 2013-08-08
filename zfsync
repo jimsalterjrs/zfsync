@@ -2,9 +2,18 @@
 
 ## zfsync - synchronize latest snapshot from a source to a target using ZFS incremental rollup snapshots (zfs send -R -I).
 
-## temp format: zfsync [[user@]host:]source target [-z]
-## the -z argument adds ZFS compression.
-## sources in the format host:path or user@host:path will add SSH transport.
+## temp format: zfsync [user@]host:source target [minpercentfree]
+##
+## zfsync currently REQUIRES SSH transport for the source
+## and CANNOT use SSH transport for the target - ie "pull"
+## backups only, no push.
+##
+## [minpercentfree] is the minimum percentage of the target
+## which must be free before replication will occur.  zfsync
+## will prune non-zfsync snapshots from oldest to newest
+## in order to try to create this space, and die if there
+## still isn't enough after all but one (non-zfsync) snapshot
+## have been pruned.  If not specified, 0.1 (10%) is assumed.
 ##
 ## example: zfsync root@localhost:locutus/source locutus/target
 
@@ -41,8 +50,12 @@ $use_remote_mbuffer = 1;
 $remote_mbuffer_size = '128M';
 $remote_mbuffer = "/usr/bin/mbuffer";
 
-$source = $ARGV[0];
-$target = $ARGV[1];
+$source 	= $ARGV[0];
+$target 	= $ARGV[1];
+$min_free_space = $ARGV[2];
+
+# default 10% minimum free space required
+if ($min_free_space eq '') { $min_free_space = 0.1; }
 
 if ($use_gz) {
 	$compress = 1;
@@ -97,40 +110,19 @@ $hostid = hostname;
 my @dateparts = &get_date;
 my $datestamp = $dateparts[4];
 
-# get a list of zfsync snapshots from the source
-#print STDERR "Getting list of snapshots from source...\n";
-@sourcesnaps = `$ssh $zfs list -rH -t snapshot -o name $source`;
+# create zfsync snapshot on the source
+$newsnap = "zfsync\_$hostid\_$datestamp";
+print STDERR "Creating $newsnap on $source...\n";
+system("$ssh $zfs snapshot $source\@$newsnap");
 
-#print "@sourcesnaps\n\n";
-
-# building a single command to get the list of creation,referenced for each snapshot on source.
-# we'll run the command on the target once it's built.
-# this avoids unnecessary SSH tunnel creation overhead.
-my $cmd;
-foreach $sourcesnap(@sourcesnaps) {
-	chomp $sourcesnap;
-	$cmd .= "$zfs get -Hp -o name,property,value creation,referenced $sourcesnap; ";
-}
-#print STDERR "Getting details on source snapshots... ";
-@sourcesnaprawdetails = `$ssh '$cmd'`;
-#print STDERR "details received.\n";
-
-# build a hash for the source snapshot details.
-foreach $ssrow (@sourcesnaprawdetails) {
-	@ssrow = split " ",$ssrow;
-	# we only want the snapshot ID, not the zfs pathname
-	$ssrow[0] =~ s/^.*?\@//;
-	$ssdetails {$ssrow[0]}{$ssrow[1]} = $ssrow[2];
-}
-
-#print "Hash built:\n";
-#foreach $name ( sort { $ssdetails{$b}{'creation'} <=> $ssdetails{$a}{'creation'} } keys %ssdetails ) {
-#	print "name: $name creation: $ssdetails{$name}{'creation'} referenced: $ssdetails{$name}{'referenced'}\n";
-#}
+# get a list of snapshots from the source, including the
+# one we just created
+my %ssdetails = getsnaps($zfs,$ssh,$source);
 
 # does the target exist yet?
-@targetexists = `$zfs list -o name`;
-while (my $snap = pop(@targetexists)) { 
+my $targetexists = 0;
+my @targetexists = `$zfs list -o name`;
+while ( my $snap = pop(@targetexists) ) { 
 	chomp $snap;
 	if ($snap eq $target) { $targetexists=1; }
 }
@@ -148,46 +140,25 @@ if ($targetexists) {
 		$targetexists = 0;
 	} else {
 		# we have snapshots, now we need details to match up with the source
-		my $cmd;
-		foreach $targetsnap (@targetsnaps) {
-		        chomp $targetsnap;
-		        $cmd .= "$zfs get -Hp -o name,property,value creation,referenced $targetsnap; ";
-		}
-
-		#print STDERR "Getting details on target snapshots... ";
-		@targetsnaprawdetails = `$cmd`;
-		#print STDERR "details received.\n";
-		
-		# build a hash for the target snapshot details.
-		foreach $tsrow (@targetsnaprawdetails) {
-		        @tsrow = split " ",$tsrow;
-			# we only want the snapshot ID, not the zfs pathname
-			$tsrow[0] =~ s/^.*?\@//;
-		        $tsdetails {$tsrow[0]}{$tsrow[1]} = $tsrow[2];
-		}
-
-		#foreach $name ( sort { $tsdetails{$b}{'creation'} <=> $tsdetails{$a}{'creation'} } keys %tsdetails ) {
-                #	print "name: $name creation: $tsdetails{$name}{'creation'} referenced: $tsdetails{$name}{'referenced'}\n";
-		#}
+		%tsdetails = getsnaps ($zfs,'',$target);
 	}
 }
 
-if ($numtargetsnaps) {
-	# make sure we have a snap on the source to match a targetsnap
+# make sure we have a snap on the source to match a targetsnap
+my $matched = 0;
+if ($targetexists && $numtargetsnaps) {
 	#print STDERR "Attempting to match zfsync snapshots on source and target.\n";
 	# iterate the target hash in reverse creation order (ie, newest creation first)
-	foreach $name ( sort { $tsdetails{$b}{'creation'} <=> $tsdetails{$a}{'creation'} } keys %tsdetails ) {
-	        #print "name: $name creation: $tsdetails{$name}{'creation'} referenced: $tsdetails{$name}{'referenced'}\n";
+	foreach my $name ( sort { $tsdetails{$b}{'creation'} <=> $tsdetails{$a}{'creation'} } keys %tsdetails ) {
 		if (
 		     ! $matched
 		     && $tsdetails{$name}{'creation'} == $ssdetails{$name}{'creation'}
-		     #&& $tsdetails{$name}{'referenced'} == $ssdetails {$name}{'referenced'}
 		   ) {
 			#print STDERR "Match found: snapshot $name exists with same creation on source and target.\n";
 			$matched = 1;
 			$oldsnap = $name;
           
-			$used = `$ssh zfs diff $source\@$name $source`;
+			$used = `$ssh $zfs diff $source\@$oldsnap $source`;
 			if ($used eq '') {
 				#print STDERR "No new data on $source since \@$name - nothing to sync, exiting.\n";
 				print STDERR "No new data on $source to sync, exiting.\n";
@@ -196,31 +167,33 @@ if ($numtargetsnaps) {
 		}	
 	}
 
-	# we're going to have to destroy target if there are no source zfsync snaps
+	# if we DO have snapshots on the target, but none of them match the source, let's just die honorably now. ='(
 	if (! $matched) {
 		print STDERR "No matching zfsync snaps between source and target: committing seppuku now.\n";
 		exit 3;
-		system ("$zfs destroy -r $target");
-		$targetexists = 0;
 	}
 }	
 
-# create zfsync snapshot on the source
-$newsnap = "zfsync\_$hostid\_$datestamp";
-print STDERR "Creating $newsnap on $source...\n";
-system("$ssh $zfs snapshot $source\@$newsnap");
+# Before we actually try to sync, let's make sure we have enough space on the target.
+# If we DON'T have enough space, let's prune some snapshots and try to make some.
+if ( $targetexists 
+     && (! &prune ($zfs,$target,$min_free_space)) 
+   ) {
+	# We couldn't make enough free space - die with honor. ='(
+	die "All but one non-zfsync snapshots pruned, still less than " . $min_free_space * 100 . "% free.  Exiting.\n";
+}
 
-if (! $targetexists) {
+if ($targetexists) {
+	# incremental send yo.  rollback the target to the newest matched snapshot first.
+	print STDERR "Rolling $target back to \@$oldsnap before transfer.\n";
+	system ("$zfs rollback -r $target\@$oldsnap");
+	@sendsize = `$ssh zfs send -nP -R -I $source\@$oldsnap $source\@$newsnap 2>&1`;
+	$SOURCE = "$ssh \'$zfs send -R -I $source\@$oldsnap $source\@$newsnap $gzip \' $zcat ";
+} else {
 	# Woo, first sync... this'll be a hot minute, amirite?
 	print STDERR "$target does not exist - will be created with initial transfer.\n";
 	@sendsize = `$ssh $zfs send -nP -R $source\@$newsnap 2>&1`;
 	$SOURCE = "$ssh \'$zfs send -R $source\@$newsnap $gzip \' $zcat ";
-} else {
-	# incremental send yo.  rollback the target to the newest matched snapshot first.
-	print STDERR "Rolling $target back to \@$oldsnap before transfer.\n";
-	system ("$zfs rollback $target\@$oldsnap");
-	@sendsize = `$ssh zfs send -nP -R -I $source\@$oldsnap $source\@$newsnap 2>&1`;
-	$SOURCE = "$ssh \'$zfs send -R -I $source\@$oldsnap $source\@$newsnap $gzip \' $zcat ";
 }
 
 # process sendsize: last line is summary, remove human-readable crap from it to get xfer estimate in bytes
@@ -280,23 +253,9 @@ close TARGET
 $success = `$zfs list -t snap $target\@$newsnap`;
 
 if ($success) { 
-	#print STDERR "\nPruning old zfsync snaps on $source... ";
-	my $cmd;
-	foreach $name ( sort { $ssdetails{$b}{'creation'} <=> $ssdetails{$a}{'creation'} } keys %ssdetails ) {
-		if ($name =~ /zfsync\_$hostid/) {
-			$cmd .= "$zfs destroy $source\@$name ; ";
-		}
-	}
-	system ("$ssh '$cmd'");
-	#print STDERR "old zfsync snaps on $source pruned.\n";
-
-	#print STDERR "Pruning old zfsync snaps on $target... ";
-	foreach $name ( sort { $tsdetails{$b}{'creation'} <=> $tsdetails{$a}{'creation'} } keys %tsdetails ) {
-		if ($name =~ /zfsync_$hostid/) {
-			system("$zfs destroy $target\@$name");
-		}
-	}
-	#print STDERR "old zfsync snaps on $target pruned.\n";
+	#print STDERR "\nPruning old zfsync snapshots... ";
+	&prune_zfsync_snapshots ($zfs,$ssh,$source);
+	&prune_zfsync_snapshots ($zfs,'',$target);
 
 	print "\nTransfer complete! Updated $target from \@$oldsnap to \@$newsnap.\n"; 
 	exit 0;
@@ -318,7 +277,7 @@ if ($success) {
 	exit 3;
 }
 
-exit;
+exit 0;
 
 sub get_date {
         ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(time);
@@ -333,3 +292,160 @@ sub get_date {
         return ($sec,$min,$hour,$unix_time,$datestamp);
 }
 
+sub getsnaps {
+	## 
+	## three arguments needed
+	##
+	## $zfs_cmd - command to run zfs
+	## $ssh     - ssh command including the host - pass blank
+	##            arg to run on localhost
+	## $system  - the name of the ZFS filesystem
+	##
+	## returns a hash of all the snapshots on the 
+	## filesystem along with their creation timestamps.
+
+	my $zfs_cmd = shift;
+	my $ssh = shift;
+	my $system = shift;
+
+	my @snaps = `$ssh $zfs_cmd list -rH -t snapshot -o name $system`;
+	
+	# building a single command to get the creation timestamp
+	# for each snapshot on $system. we'll run the command once it's built.
+	# this avoids unnecessary SSH tunnel creation overhead.
+	my $cmd;
+	foreach my $snap(@snaps) {
+		chomp $snap;
+		$cmd .= "$zfs_cmd get -Hp -o name,property,value creation,referenced $snap; ";
+	}
+
+	my @snaprawdetails;
+	if ($cmd ne '') { 
+		if ($ssh ne '' ) { @snaprawdetails = `$ssh \'$cmd\'`; } 
+			else { @snaprawdetails = `$cmd`; }
+	}
+	
+	# build a hash for the snapshot details.
+	my %sdetails;
+	foreach my $srow (@snaprawdetails) {
+		my @srow = split " ",$srow;
+		# we only want the snapshot ID, not the zfs pathname
+		$srow[0] =~ s/^.*?\@//;
+		$sdetails {$srow[0]}{$srow[1]} = $srow[2];
+	}
+
+	#foreach my $name ( keys %sdetails ) {
+	#	print "name: $name creation: $sdetails{$name}{'creation'} \n";
+	#}
+
+	return %sdetails;
+}
+
+sub prune_zfsync_snapshots {
+	
+	## get rid of all but the last zfsync snapshot on $system.
+	## takes arguments $zfs_cmd, $ssh, $system.
+	##
+	## $ssh should include ssh command and remote hostname.
+	## $ssh should be blank if you want to prune on the local system.
+	
+	my $zfs_cmd = shift;
+	my $ssh = shift;
+	my $system = shift; 
+
+	# let's get a fresh list of snapshots
+	my %sdetails = getsnaps ($zfs_cmd, $ssh, $system);
+	
+	my $cmd;
+	my $skippedthefirst=0;
+	foreach my $name ( sort { $sdetails{$a}{'creation'} <=> $sdetails{$b}{'creation'} } keys %sdetails ) {
+		if ($name =~ /zfsync\_$hostid/) {
+			if ($skippedthefirst) { $cmd .= "$zfs destroy $system\@$name ; "; } else { $skippedthefirst = 1; }
+		}
+	}
+
+	# if there's a command to run, run it.
+	if ($cmd ne '') { 
+		if ($ssh ne '') {
+			system ("$ssh '$cmd'"); 
+		} else {
+			system ($cmd);
+		}
+	}
+}
+
+sub prune {
+	## prune takes arguments zfs_cmd, zfs_target, min_free_percentage
+	##
+	## min_free_percentage should be in decimal form, ie 0.1 for 10%
+	##
+	## snapshots on zfs_target will be pruned from oldest to newest
+	## until >= min_free_percentage is available on zfs_target.
+	##
+	## prune will refuse to prune snapshots in the form /zfsync/,
+	## and it will not prune the very newest NON-zfsync snapshot
+	## either.
+	##
+	## prune is fairly noisy, but writes only to STDERR, never STDOUT,
+	## so it won't spam up any cron logs or mailed reports unless its
+	## parent is invoked 2>&1 or similar.
+	##
+	## note: prune will DIE, not return, if not passed any of its
+	## required arguments.  this is a feature, not a bug. =)
+	##
+	## prune returns 1 on success, 0 on failure.
+
+	my $zfs_cmd = shift;			# first argument passed to function
+	my $zfs_target = shift;			# second argument passed to the function
+	my $min_free_percentage = shift;	# third argument passed to the function
+	
+	if ($zfs_cmd eq '') { die "Please specify a path to the local ZFS command.\n"; }
+	if ($zfs_target eq '') { die "Please specify a ZFS target to prune.\n"; }
+	if ($min_free_percentage eq '') { die "Please specify a minimum free percentage.\n"; }
+		
+	my $free_space = (`$zfs_cmd get -Hp available -o value $zfs_target`)/1024;
+	my $disp_free_space = sprintf("%.2f", ($free_space/1024/1024)) . 'G';
+	my $mirror_size = (`$zfs_cmd get -Hp usedbydataset -o value $zfs_target`)/1024;
+	my $filesystem_size = (`$zfs_cmd get -Hp used -o value $zfs_target`)/1024 + $free_space;
+	my $min_free_space = $filesystem_size * $min_free_percentage;
+	my $disp_min_free_space = sprintf("%.2f", $min_free_space/1024/1024) . 'G';
+	my $percent_free = sprintf("%.2f", ($free_space / $filesystem_size * 100));
+	
+	if ($free_space >= $min_free_space) {
+		print STDERR "\nMinimum free space is $disp_min_free_space (" . ($min_free_percentage * 100) . "%) ; $disp_free_space ($percent_free" . "\%) free.\n";
+		return 1;
+	}
+	
+	# don't try to prune zfsync snapshots for space, please.
+	my @rawsnapshots = `$zfs_cmd list -rH -t snapshot -S creation -o name $zfs_target`;
+	while (my $snap = pop @rawsnapshots) {
+		chomp $snap;
+		if (! ($snap =~ /zfsync/)) { push @snapshots,$snap; }
+	}	
+	
+	# turns out this loop won't remove the very last snapshot. 
+	# in original intent, this was a bug.  on careful reflection, 
+	# however, it's a feature.
+	
+	my $snapshot_count = $#snapshots;
+	while (($free_space < $min_free_space) * ($snapshot_count > 0)) {
+		my $next_snapshot = shift(@snapshots);
+		print STDERR "$disp_free_space ($percent_free" . "\%) free ; $disp_min_free_space (" . ($min_free_percentage * 100) . "%) required: ";
+	        print STDERR "pruning $next_snapshot ... \n";
+	        system ("$zfs_cmd destroy -rR $next_snapshot") ;
+	                # or die "could not prune $next_snapshot: $?"
+	        $snapshot_count += -1;
+		$free_space = (`$zfs_cmd get -Hp available -o value $zfs_target`)/1024;
+		$percent_free = sprintf("%.2f", ($free_space / $filesystem_size * 100));
+		$disp_free_space = sprintf("%.2f", ($free_space/1024/1024)) . 'G';
+	}
+	
+	if ($free_space >= $min_free_space) {
+		print STDERR "Minimum free space is $disp_min_free_space (" . ($min_free_percentage * 100) . "%) ; $disp_free_space ($percent_free" . "\%) free.\n\n";
+		return 1;
+	} else {
+		print STDERR "\nAll but one non-zfsync snapshots pruned, but only ";
+		print STDERR "$disp_free_space ($percent_free" . "\%) free ; $disp_min_free_space (" . ($min_free_percentage * 100) . "%) required.\n\n";
+		return 0;
+	}
+}
