@@ -335,7 +335,7 @@ sub getsnaps {
 	}
 
 	#foreach my $name ( keys %sdetails ) {
-	#	print "name: $name creation: $sdetails{$name}{'creation'} \n";
+	#	print STDERR "name: $name creation: $sdetails{$name}{'creation'} \n";
 	#}
 
 	return %sdetails;
