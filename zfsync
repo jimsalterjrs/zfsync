@@ -199,7 +199,7 @@ if ($targetexists && $numtargetsnaps) {
 
 	# if we DO have snapshots on the target, but none of them match the source, let's just die honorably now. ='(
 	if (! $matched) {
-		print "FAILURE: no matching zfsync snaps between source and target: committing seppuku now.\n";
+		print "FAILURE: no matching zfsync snaps between $sourcehost:$source and $target: committing seppuku now.\n";
 		exit 3;
 	}
 }	
