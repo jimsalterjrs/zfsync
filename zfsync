@@ -69,7 +69,6 @@ my $cipher = "-c arcfour";
 # it automatically on the remote host.
 my $use_remote_mbuffer = 0;
 my $remote_mbuffer_size = '128M';
-my $remote_mbuffer = "/usr/bin/mbuffer";
 
 my $compress; 
 my $gzip; 
@@ -117,7 +116,6 @@ elsif (-e '/usr/local/opt/pv') { $pv = '/usr/local/opt/pv'; }
 
 # if we have mbuffer available on the system, let's find it and use it.
 my $local_mbuffer;
-my $remote_mbuffer;
 if (-e '/sbin/mbuffer') { $local_mbuffer = '/sbin/mbuffer'; }
 elsif (-e '/bin/mbuffer') { $local_mbuffer = '/bin/mbuffer'; }
 elsif (-e '/usr/sbin/mbuffer') { $local_mbuffer = '/usr/sbin/mbuffer'; }
@@ -127,6 +125,9 @@ elsif (-e '/usr/local/bin/mbuffer') { $local_mbuffer = '/usr/local/bin/mbuffer';
 elsif (-e '/opt/mbuffer') { $local_mbuffer = '/opt/mbuffer'; }
 elsif (-e '/usr/local/opt/mbuffer') { $local_mbuffer = '/usr/local/opt/mbuffer'; }
 else { $use_local_mbuffer = 0; }
+
+# must do better... sigh
+my $remote_mbuffer = $local_mbuffer;
 
 # reasonable defaults to mbuffer... not so sure the -s 128k is a win, though?
 $local_mbuffer .= " -q -s 128k -m $local_mbuffer_size";
