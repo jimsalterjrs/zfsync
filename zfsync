@@ -32,12 +32,15 @@
 ## still isn't enough after all but one (non-zfsync) snapshot
 ## have been pruned.  If not specified, 0.1 (10%) is assumed.
 
-require IO::Handle;
+#require IO::Handle;
+use Sys::Syslog;
 use Sys::Hostname;
 
 my $source = $ARGV[0];
 my $target = $ARGV[1];
 my $min_free_space = $ARGV[2];
+
+my $begintime = time; # we'll use this for time elapsed info messages when we quit
 
 # default 10% minimum free space required
 if ($min_free_space eq '') { $min_free_space = 0.1; }
@@ -174,6 +177,9 @@ if ($targetexists) {
 	}
 }
 
+# let's emit the important stuff to the log as well as to STDOUT
+openlog('zfsync','nofatal,pid','LOG_DAEMON');
+
 # make sure we have a snap on the source to match a targetsnap
 my $matched = 0;
 my $oldsnap;
@@ -191,7 +197,11 @@ if ($targetexists && $numtargetsnaps) {
           
 			my $used = `$ssh $zfs diff $source\@$oldsnap $source`;
 			if ($used eq '') {
-				print "SUCCESS: No new data on $source to sync, exiting.\n";
+				my $elapsed = elapsed($begintime);
+				my $msg = "SUCCESS: No new data on $source to sync, exiting. ($elapsed elapsed)\n";
+				print $msg;
+				syslog('INFO',$msg);
+				closelog();
 				exit 0;
 			} 
 		}	
@@ -199,7 +209,11 @@ if ($targetexists && $numtargetsnaps) {
 
 	# if we DO have snapshots on the target, but none of them match the source, let's just die honorably now. ='(
 	if (! $matched) {
-		print "FAILURE: no matching zfsync snaps between $sourcehost:$source and $target: committing seppuku now.\n";
+		my $elapsed = elapsed($begintime);
+		my $msg = "FAILURE: no matching zfsync snaps between $sourcehost:$source and $target: committing seppuku now. ($elapsed elapsed)\n";
+		print $msg;
+		syslog('WARN',$msg);
+		closelog();
 		exit 3;
 	}
 }	
@@ -210,7 +224,11 @@ if ( $targetexists
      && (! &prune ($zfs,$target,$min_free_space)) 
    ) {
 	# We couldn't make enough free space - die with honor. ='(
-	print "FAILURE: all but one non-zfsync snapshots pruned, still less than " . $min_free_space * 100 . "% free.  Exiting.\n";
+	my $elapsed = elapsed($begintime);
+	my $msg = "FAILURE: all but one non-zfsync snapshots pruned, still less than " . $min_free_space * 100 . "% free.  Exiting. ($elapsed elapsed)\n";
+	print $msg;
+	syslog('WARN',$msg);
+	closelog();
 	exit 5;
 }
 
@@ -245,7 +263,11 @@ if ($targetexists) {
 	# do we have enough space to accommodate the new snapshots?  If not, die honorably ='(
 	my $free_space = (`$zfs get -Hp available -o value $target`);  # bytes
 	if ($sendsize > $free_space) { 
-		print "FAILURE: Not enough space on $target for $disp_sendsize of data from $sourcehost:$source... exiting.\n";
+		my $elapsed = elapsed($begintime);
+		my $msg = "FAILURE: Not enough space on $target for $disp_sendsize of data from $sourcehost:$source... exiting. ($elapsed elapsed)\n";
+		print $msg;
+		syslog('WARN',$msg);
+		closelog();
 		# Let's clean up the unnecessary zfsync snapshot we created on the source
 		# before seppuku is final, shall we?
 		system ("$ssh '$zfs destroy $source\@$newsnap'");
@@ -320,7 +342,11 @@ $success = `$zfs list -t snap $target\@$newsnap`;
 if ($success) { 
 	&prune_zfsync_snapshots ($zfs,$ssh,$source);
 	&prune_zfsync_snapshots ($zfs,'',$target);
-	print "SUCCESS: Updated $target from \@$oldsnap to \@$newsnap ($disp_xferred transferred)\n"; 
+	my $elapsed = elapsed($begintime);
+	my $msg = "SUCCESS: Updated $target from \@$oldsnap to \@$newsnap ($disp_xferred transferred, $elapsed elapsed)\n"; 
+	print $msg;
+	syslog('INFO',$msg);
+	closelog();
 	exit 0;
 } else { 
 	# well, we crashed and burned - but did we get ANY snapshots successfully replicated before we did?
@@ -329,16 +355,20 @@ if ($success) {
 	$newtargetsnap =~ s/^.*?\@//;
 	chomp $newtargetsnap;
 
-	print "FAILURE: ";
+	my $msg = "FAILURE: ";
 
 	if ($newtargetsnap ne $oldsnap) {
 		# Yay, we at least managed SOME replication!
-		print "successfully updated $target\@$oldsnap as far as \@$newtargetsnap but ";
+		$msg .= "successfully updated $target\@$oldsnap as far as \@$newtargetsnap but ";
 	} else {
 		# Boo, we completely wasted our time, bandwidth, and storage load ='(
-		print "no successful updates, ";
+		$msg .= "no successful updates, ";
 	}
-	print "died after transferring $disp_xferred of approximately $disp_sendsize"; 
+	my $elapsed = elapsed($begintime);
+	$msg .= "died after transferring $disp_xferred of approximately $disp_sendsize ($elapsed elapsed)"; 
+	print $msg;
+	syslog('WARN',$msg);
+	closelog();
 	# Let's clean up the unnecessary zfsync snapshot we created on the source
 	# before seppuku is final, shall we?
 	system ("$ssh '$zfs destroy $source\@$newsnap'");
@@ -518,4 +548,26 @@ sub prune {
 		print STDERR "$disp_free_space ($percent_free" . "\%) free ; $disp_min_free_space (" . ($min_free_percentage * 100) . "%) required.\n\n";
 		return 0;
 	}
+}
+
+sub elapsed {
+	# take a begintime in UNIX time, return elapsed time since then in human readable form
+	my $begintime = shift;
+	my $endtime = time;
+	my $elapsed = $endtime - $begintime;
+
+	my $days = int ($elapsed / 60 / 60 / 24);
+	$elapsed -= $days * 60 * 60 * 24;
+	my $hours = int ($elapsed / 60 / 60);
+	$elapsed -= $hours * 60 * 60;
+	my $minutes = int ($elapsed / 60);
+	$elapsed -= $minutes * 60;
+	my $seconds = int($elapsed);
+	my $humanreadable;
+	if ($days) { $humanreadable .= " $days" . 'd'; }
+	if ($hours || $days) { $humanreadable .= " $hours" . 'h'; }
+	if ($minutes || hours || days) { $humanreadable .= " $minutes" . 'm'; }
+	$humanreadable .= " $seconds" . 's';
+	$humanreadable =~ s/^ //;
+	return $humanreadable;
 }
