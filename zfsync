@@ -259,6 +259,11 @@ if ($sendsize > 1024*1024*1024) {
 	$disp_sendsize = sprintf("%d",$sendsize/1024) . ' KB';
 }
 
+# we'll need to check the target to see if it has readonly set -
+# if it does, great; if not, we'll need to set it readonly during
+# the transfer and then set readonly off again after we're done.
+my $target_readonly = 0;
+
 if ($targetexists) {
 	# do we have enough space to accommodate the new snapshots?  If not, die honorably ='(
 	my $free_space = (`$zfs get -Hp available -o value $target`);  # bytes
@@ -273,8 +278,17 @@ if ($targetexists) {
 		system ("$ssh '$zfs destroy $source\@$newsnap'");
 		exit 4;
 	} else {
-		# enough free space, and it's an incremental send yo.  
-		# let's rollback the target to the newest matched snapshot first.
+		# enough free space, and it's an incremental send yo.
+		# first thing we have to do is set this sucker readonly if it already isn't,
+		# so our sync doesn't bomb out when somebody ls'es a directory while it's
+		# mounted r/w or whatever.
+		#
+		# yes, I discovered the need for this the hard way.
+		#
+		$target_readonly = `$zfs get -Hp -o value readonly $target`;
+		$target_readonly = ($target_readonly eq 'on');
+		if (! $target_readonly) { system ("$zfs set readonly='on' $target"); }
+		# now let's rollback the target to the newest matched snapshot, just in case.
 		print STDERR "Rolling back to $target\@$oldsnap before transfer.\n";
 		system ("$zfs rollback -r $target\@$oldsnap");
 	}
@@ -338,6 +352,8 @@ close TARGET
 	: "Exit status $? from zfs receive\n";
 
 $success = `$zfs list -t snap $target\@$newsnap`;
+
+if (! $target_readonly) { system("$zfs set readonly=off $target"); }
 
 if ($success) { 
 	&prune_zfsync_snapshots ($zfs,$ssh,$source);
