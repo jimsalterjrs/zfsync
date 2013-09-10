@@ -2,7 +2,7 @@
 
 ## zfsync - synchronize new snapshots from a remote source 
 ## to a local target using SSH transport and ZFS incremental 
-## rollup snapshots (zfs send -R -I).
+## rollup snapshots (zfs send -I).
 ##
 ## syntax: zfsync [user@]host:source target [minpercentfree]
 ##
@@ -47,7 +47,8 @@ if ($min_free_space eq '') { $min_free_space = 0.1; }
 
 # Yay gzip!  Yay conserved network bandwidth! Feel free to 
 # disable if you hate your network.  And fun.  And puppies.
-my $use_gz = 1;
+#my $use_gz = 1;
+
 
 # A local copy of mbuffer really whips the llama's ass -
 # even with a mere 64M allocated, it came close to doubling
@@ -162,7 +163,11 @@ my $numtargetsnaps;
 my %tsdetails;
 if ($targetexists) { 
 	#print STDERR "Target exists.  Finding snapshots... ";
-	@targetsnaps = `$zfs list -rH -t snapshot -S creation -o name $target`;
+	my @rawtargetsnaps = `$zfs list -rH -t snapshot -S creation -o name $target`;
+	foreach my $snap (@rawtargetsnaps) {
+		if (! ($snap =~ /$target\//) ) { push @targetsnaps, $snap; }
+	}
+
 	$numtargetsnaps = scalar @targetsnaps;
 	#print STDERR "found $numtargetsnaps snapshots on target.\n";
 
@@ -235,13 +240,14 @@ if ( $targetexists
 my @sendsize;
 my $SOURCE;
 if ($targetexists) {
-	@sendsize = `$ssh zfs send -nP -R -I $source\@$oldsnap $source\@$newsnap 2>&1`;
-	$SOURCE = "$ssh \'$zfs send -R -I $source\@$oldsnap $source\@$newsnap $gzip \' $zcat ";
+	@sendsize = `$ssh zfs send -nP -I $source\@$oldsnap $source\@$newsnap 2>&1`;
+	$SOURCE = "$ssh \'$zfs send -I $source\@$oldsnap $source\@$newsnap $gzip \' $zcat ";
 } else {
 	# Woo, first sync... this'll be a hot minute, amirite?
 	print STDERR "$target does not exist - will be created with initial transfer.\n";
-	@sendsize = `$ssh $zfs send -nP -R $source\@$newsnap 2>&1`;
-	$SOURCE = "$ssh \'$zfs send -R $source\@$newsnap $gzip \' $zcat ";
+	@sendsize = `$ssh $zfs send -nP $source\@$newsnap 2>&1`;
+
+	$SOURCE = "$ssh \'$zfs send $source\@$newsnap $gzip \' $zcat ";
 }
 
 # process sendsize: last line of multi-line output is 
@@ -306,7 +312,7 @@ if ($use_remote_mbuffer) {
 	$SOURCE =~ s/\' /\| $remote_mbuffer \' /;
 }
 
-#print STDERR "\nEffective command: $SOURCE | $TARGET\n\n";
+# print STDERR "\nEffective command: $SOURCE | $TARGET\n\n";
 
 open SOURCE, "$SOURCE |"
         or print $! ? "Error opening zfs send: $!"
@@ -424,8 +430,14 @@ sub getsnaps {
 	my $ssh = shift;
 	my $system = shift;
 
-	my @snaps = `$ssh $zfs_cmd list -rH -t snapshot -o name $system`;
-	
+	my @rawsnaps = `$ssh $zfs_cmd list -rH -t snapshot -o name $system`;
+	my @snaps;
+
+	# remove any snapshots of CHILD filesystems!
+	foreach my $snap(@rawsnaps) {
+		if (! ($snap =~ /$system\//) ) { push @snaps,$snap; }
+	}
+
 	# building a single command to get the creation timestamp
 	# for each snapshot on $system. we'll run the command once it's built.
 	# this avoids unnecessary SSH tunnel creation overhead.
