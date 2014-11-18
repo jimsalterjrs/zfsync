@@ -1,3 +1,32 @@
+zfsync has been discontinued and completely rewritten from scratch under a new name and new project.
+
+Please see https://github.com/jimsalterjrs/sanoid - what was formerly zfsync is now Syncoid, the replication tool used as part of the Sanoid project.
+
+=====================================================================================================================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 zfsync is a Perl wrapper for zfs send | zfs receive, with built-in pruning of snapshots
 to maintain a minimum free space level on the target.  It's intended to make synchronizing 
 a local ZFS filesystem with a remote one much simpler and less painful.
